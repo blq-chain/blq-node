@@ -82,7 +82,10 @@ const RECOVERY_MIN_BATCH_WINDOW: Duration = Duration::from_secs(20);
 const MAX_DISCOVERY_PEERS: usize = 1_024;
 const MAX_RELAY_NODES: usize = 1_024;
 const MAX_RELAY_MESSAGES_PER_NODE: usize = 256;
-const MAX_P2P_CONNECTIONS: usize = 128;
+const DEFAULT_MAX_SAVED_PEERS: usize = 32;
+const MAX_SAVED_PEERS: usize = 512;
+const MAX_ROUTES_PER_SAVED_PEER: usize = 4;
+const P2P_PEER_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_LIVE_TIMESTAMP_FUTURE_DRIFT_SECONDS: u64 = 30;
 // Confirmation depth is operational metadata for clients and retention. It
 // is deliberately not a consensus checkpoint: PoW fork choice always follows
@@ -186,6 +189,7 @@ static SYNC_SESSION_STARTED_AT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SYNC_IDENTITIES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 static ACTIVE_RECOVERY_JOBS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 static KNOWN_PEER_IDENTITIES: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+static CACHED_PEER_ROUTES: OnceLock<Mutex<BTreeMap<String, CachedPeerRoute>>> = OnceLock::new();
 static P2P_ROUTE_FAILURES: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
 static BRANCH_SYNC_CURSORS: OnceLock<Mutex<BTreeMap<String, BranchSyncCursor>>> = OnceLock::new();
 // Cursor updates are made by primary, witness, watchdog, and failover
@@ -786,12 +790,168 @@ fn known_peer_identities() -> &'static Mutex<BTreeMap<String, String>> {
     KNOWN_PEER_IDENTITIES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedPeerRoute {
+    identity_public_key: String,
+    routes: Vec<String>,
+    last_success_epoch: u64,
+    #[serde(default)]
+    last_failure_epoch: Option<u64>,
+    expires_at_epoch: u64,
+}
+
+fn cached_peer_routes() -> &'static Mutex<BTreeMap<String, CachedPeerRoute>> {
+    CACHED_PEER_ROUTES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 fn p2p_route_failures() -> &'static Mutex<BTreeMap<String, u64>> {
     P2P_ROUTE_FAILURES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn peer_identity_path(config: &NodeConfig) -> PathBuf {
     Path::new(&config.node.data_dir).join("peer-identities.json")
+}
+
+fn peer_route_cache_path(config: &NodeConfig) -> PathBuf {
+    Path::new(&config.node.data_dir).join("peer-routes.json")
+}
+
+fn normalize_peer_route(route: &str) -> Result<String> {
+    Ok(route
+        .parse::<SocketAddr>()
+        .map_err(|err| anyhow::anyhow!("peer route is invalid: {err}"))?
+        .to_string())
+}
+
+fn valid_cached_peer_identity(identity: &str) -> bool {
+    identity.len() == 66
+        && identity.is_ascii()
+        && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cached_peer_route_is_valid(peer: &CachedPeerRoute) -> bool {
+    valid_cached_peer_identity(&peer.identity_public_key)
+        && !peer.routes.is_empty()
+        && peer.routes.len() <= MAX_ROUTES_PER_SAVED_PEER
+        && peer.expires_at_epoch >= unix_now()
+        && peer
+            .routes
+            .iter()
+            .all(|route| normalize_peer_route(route).is_ok())
+}
+
+fn trim_cached_peer_routes(routes: &mut BTreeMap<String, CachedPeerRoute>, limit: usize) {
+    routes.retain(|identity, peer| {
+        identity == &peer.identity_public_key && cached_peer_route_is_valid(peer)
+    });
+    while routes.len() > limit {
+        let eviction = routes
+            .iter()
+            .min_by_key(|(identity, peer)| {
+                (
+                    peer.expires_at_epoch,
+                    peer.last_success_epoch,
+                    (*identity).clone(),
+                )
+            })
+            .map(|(identity, _)| identity.clone());
+        let Some(identity) = eviction else {
+            break;
+        };
+        routes.remove(&identity);
+    }
+}
+
+fn persist_cached_peer_routes(config: &NodeConfig) -> Result<()> {
+    let path = peer_route_cache_path(config);
+    let data = serde_json::to_vec_pretty(
+        &*cached_peer_routes()
+            .lock()
+            .expect("cached peer routes mutex poisoned"),
+    )?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, data)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_cached_peer_routes(config: &NodeConfig) {
+    let path = peer_route_cache_path(config);
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let loaded = match serde_json::from_slice::<BTreeMap<String, CachedPeerRoute>>(&bytes) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("could not load persisted peer route cache: {err}");
+            return;
+        }
+    };
+    let mut routes = cached_peer_routes()
+        .lock()
+        .expect("cached peer routes mutex poisoned");
+    routes.extend(loaded);
+    trim_cached_peer_routes(&mut routes, config.network.max_saved_peers);
+    let identities = routes
+        .values()
+        .flat_map(|peer| {
+            peer.routes
+                .iter()
+                .cloned()
+                .map(move |route| (route, peer.identity_public_key.clone()))
+        })
+        .collect::<Vec<_>>();
+    drop(routes);
+    known_peer_identities()
+        .lock()
+        .expect("known peer identities mutex poisoned")
+        .extend(identities);
+}
+
+fn cached_peer_endpoints() -> Vec<String> {
+    cached_peer_routes()
+        .lock()
+        .expect("cached peer routes mutex poisoned")
+        .values()
+        .filter(|peer| cached_peer_route_is_valid(peer))
+        .flat_map(|peer| peer.routes.iter().cloned())
+        .collect()
+}
+
+fn remember_verified_peer_route(config: &NodeConfig, peer: &str, identity: &str) {
+    let Ok(route) = normalize_peer_route(peer) else {
+        return;
+    };
+    if !valid_cached_peer_identity(identity) {
+        return;
+    }
+    let now = unix_now();
+    let mut routes = cached_peer_routes()
+        .lock()
+        .expect("cached peer routes mutex poisoned");
+    let entry = routes
+        .entry(identity.to_string())
+        .or_insert_with(|| CachedPeerRoute {
+            identity_public_key: identity.to_string(),
+            routes: Vec::new(),
+            last_success_epoch: now,
+            last_failure_epoch: None,
+            expires_at_epoch: now.saturating_add(P2P_PEER_CACHE_TTL_SECONDS),
+        });
+    entry.routes.retain(|candidate| candidate != &route);
+    entry.routes.push(route);
+    entry
+        .routes
+        .sort_by_key(|candidate| (route_priority(candidate), candidate.clone()));
+    entry.routes.truncate(MAX_ROUTES_PER_SAVED_PEER);
+    entry.last_success_epoch = now;
+    entry.last_failure_epoch = None;
+    entry.expires_at_epoch = now.saturating_add(P2P_PEER_CACHE_TTL_SECONDS);
+    trim_cached_peer_routes(&mut routes, config.network.max_saved_peers);
+    drop(routes);
+    if let Err(err) = persist_cached_peer_routes(config) {
+        eprintln!("could not persist verified peer route for {peer}: {err}");
+    }
 }
 
 /// Route aliases are operational metadata learned only from a signed Hello.
@@ -837,6 +997,7 @@ fn remember_verified_peer_identity(config: &NodeConfig, peer: &str, identity: &s
             eprintln!("could not persist verified peer route identity for {peer}: {err}");
         }
     }
+    remember_verified_peer_route(config, peer, identity);
 }
 
 fn route_priority(route: &str) -> u8 {
@@ -2646,6 +2807,10 @@ fn p2p_session_status() -> serde_json::Value {
         .and_then(|error| error.clone());
     serde_json::json!({
         "activeP2pConnections": active,
+        "cachedPeerCount": cached_peer_routes()
+            .lock()
+            .map(|routes| routes.len())
+            .unwrap_or(0),
         "closingP2pConnections": CLOSING_P2P_SESSIONS.load(Ordering::Acquire),
         "closedP2pSessions": CLOSED_P2P_SESSIONS.load(Ordering::Acquire),
         "activeRpcConnections": ACTIVE_RPC_CONNECTIONS.load(Ordering::Acquire),
@@ -9810,10 +9975,22 @@ struct NetworkSection {
     listen: String,
     advertise_addr: Option<String>,
     bootstrap_peers: Vec<String>,
+    #[serde(default = "default_max_saved_peers")]
+    max_saved_peers: usize,
+    #[serde(default = "default_max_inbound_peers")]
+    max_inbound_peers: usize,
     discovery_servers: Vec<String>,
     relay_servers: Vec<String>,
     #[serde(default)]
     trusted_peer_keys: Vec<String>,
+}
+
+fn default_max_saved_peers() -> usize {
+    DEFAULT_MAX_SAVED_PEERS
+}
+
+fn default_max_inbound_peers() -> usize {
+    P2P_UNTRUSTED_SESSION_LIMIT
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -11207,6 +11384,16 @@ impl NodeConfig {
                 );
             }
         }
+        if config.network.max_saved_peers == 0 || config.network.max_saved_peers > MAX_SAVED_PEERS {
+            anyhow::bail!("network.max_saved_peers must be between 1 and {MAX_SAVED_PEERS}");
+        }
+        if config.network.max_inbound_peers == 0
+            || config.network.max_inbound_peers > P2P_UNTRUSTED_SESSION_LIMIT
+        {
+            anyhow::bail!(
+                "network.max_inbound_peers must be between 1 and {P2P_UNTRUSTED_SESSION_LIMIT} to preserve outbound recovery capacity"
+            );
+        }
         Ok(config)
     }
 }
@@ -11439,6 +11626,7 @@ fn run_p2p(
         enqueue_transaction_gossip(&config, &storage, transaction);
     }
     load_known_peer_identities(&config);
+    load_cached_peer_routes(&config);
     register_with_discovery_servers(&config, &storage)?;
     register_with_relay_servers(&config)?;
     start_network_registration_retry(config.clone(), Arc::clone(&storage));
@@ -11465,6 +11653,7 @@ fn run_p2p(
         Arc::clone(&peer_scores),
     );
     let mut discovered = discover_peers(&config)?;
+    discovered.extend(cached_peer_endpoints());
     discovered.extend(config.network.bootstrap_peers.clone());
     discovered.sort();
     discovered.dedup();
@@ -11575,7 +11764,7 @@ fn run_p2p(
         // beyond the cap while blocked in one read.
         stream.set_read_timeout(Some(P2P_INBOUND_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        if !try_acquire_connection(&active_connections, MAX_P2P_CONNECTIONS) {
+        if !try_acquire_connection(&active_connections, config.network.max_inbound_peers) {
             continue;
         }
         let peer_address = stream
@@ -16930,12 +17119,15 @@ mod tests {
     #[test]
     fn primary_p2p_connection_admission_is_bounded() {
         let active = AtomicUsize::new(0);
-        for _ in 0..MAX_P2P_CONNECTIONS {
-            assert!(try_acquire_connection(&active, MAX_P2P_CONNECTIONS));
+        for _ in 0..P2P_UNTRUSTED_SESSION_LIMIT {
+            assert!(try_acquire_connection(&active, P2P_UNTRUSTED_SESSION_LIMIT));
         }
-        assert!(!try_acquire_connection(&active, MAX_P2P_CONNECTIONS));
+        assert!(!try_acquire_connection(
+            &active,
+            P2P_UNTRUSTED_SESSION_LIMIT
+        ));
         active.fetch_sub(1, Ordering::AcqRel);
-        assert!(try_acquire_connection(&active, MAX_P2P_CONNECTIONS));
+        assert!(try_acquire_connection(&active, P2P_UNTRUSTED_SESSION_LIMIT));
     }
 
     #[test]
@@ -16947,6 +17139,98 @@ mod tests {
         assert!(try_acquire_inbound_address(&addresses, "192.0.2.201".to_string()).is_some());
         drop(first);
         assert!(try_acquire_inbound_address(&addresses, "192.0.2.43".to_string()).is_some());
+    }
+
+    fn cached_route(identity: &str, route: &str, last_success_epoch: u64) -> CachedPeerRoute {
+        CachedPeerRoute {
+            identity_public_key: identity.to_string(),
+            routes: vec![route.to_string()],
+            last_success_epoch,
+            last_failure_epoch: None,
+            expires_at_epoch: unix_now().saturating_add(P2P_PEER_CACHE_TTL_SECONDS),
+        }
+    }
+
+    #[test]
+    fn peer_route_cache_deduplicates_identities_and_evicts_oldest_success() {
+        let first_identity = "02".repeat(33);
+        let second_identity = "03".repeat(33);
+        let mut routes = BTreeMap::from([
+            (
+                first_identity.clone(),
+                cached_route(&first_identity, "198.51.100.1:30334", 1),
+            ),
+            (
+                second_identity.clone(),
+                cached_route(&second_identity, "198.51.100.2:30334", 2),
+            ),
+        ]);
+
+        trim_cached_peer_routes(&mut routes, 1);
+
+        assert_eq!(routes.len(), 1);
+        assert!(routes.contains_key(&second_identity));
+    }
+
+    #[test]
+    fn peer_route_cache_persists_only_verified_identity_routes() {
+        let _test_guard = SOCKET_COUNTER_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("socket counter test mutex poisoned");
+        let path = test_path("persisted-peer-routes");
+        let config = test_rpc_node_config(&path, Vec::new());
+        let identity = "02".repeat(33);
+        cached_peer_routes()
+            .lock()
+            .expect("cached peer routes mutex poisoned")
+            .clear();
+        known_peer_identities()
+            .lock()
+            .expect("known peer identities mutex poisoned")
+            .clear();
+
+        remember_verified_peer_route(&config, "198.51.100.8:30334", &identity);
+        assert!(peer_route_cache_path(&config).exists());
+
+        cached_peer_routes()
+            .lock()
+            .expect("cached peer routes mutex poisoned")
+            .clear();
+        load_cached_peer_routes(&config);
+
+        assert_eq!(cached_peer_endpoints(), vec!["198.51.100.8:30334"]);
+        assert_eq!(
+            known_peer_identities()
+                .lock()
+                .expect("known peer identities mutex poisoned")
+                .get("198.51.100.8:30334"),
+            Some(&identity)
+        );
+
+        cached_peer_routes()
+            .lock()
+            .expect("cached peer routes mutex poisoned")
+            .clear();
+        known_peer_identities()
+            .lock()
+            .expect("known peer identities mutex poisoned")
+            .clear();
+        fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn peer_route_cache_rejects_expired_or_unverified_entries() {
+        let identity = "02".repeat(33);
+        let mut expired = cached_route(&identity, "198.51.100.9:30334", 1);
+        expired.expires_at_epoch = unix_now().saturating_sub(1);
+        assert!(!cached_peer_route_is_valid(&expired));
+
+        let invalid = CachedPeerRoute {
+            identity_public_key: "not-an-identity".to_string(),
+            ..cached_route(&identity, "198.51.100.9:30334", 1)
+        };
+        assert!(!cached_peer_route_is_valid(&invalid));
     }
 
     #[test]
@@ -18364,6 +18648,8 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 advertise_addr: None,
                 bootstrap_peers,
+                max_saved_peers: DEFAULT_MAX_SAVED_PEERS,
+                max_inbound_peers: P2P_UNTRUSTED_SESSION_LIMIT,
                 discovery_servers: Vec::new(),
                 relay_servers: Vec::new(),
                 trusted_peer_keys: Vec::new(),

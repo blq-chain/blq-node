@@ -20,13 +20,21 @@ Do not distribute a binary built without that feature as a mainnet node.
    `203.159.95.9:30334` and `31.76.127.228:30334`. A node uses either as its
    first contact, completes the normal authenticated handshake, then learns
    compatible peers through peer exchange. Do not replace these with an HTTPS
-   JSON-RPC URL or port.
-4. Configure a reachable P2P advertised endpoint if accepting inbound peers.
+    JSON-RPC URL or port.
+4. `network.max_saved_peers` defaults to `32`. The node stores only routes
+   proven by an authenticated handshake in `data_dir/peer-routes.json`, so it
+   can retry healthy learned peers after a restart. Bootstrap peers remain the
+   fallback; cached routes never change chain selection.
+5. `network.max_inbound_peers` defaults to `18`. This limits incoming P2P
+   handlers while preserving six of the 24 P2P sessions for outbound bootstrap,
+   sync, and recovery work. Lower it on a small host; it must remain between
+   `1` and `18`.
+6. Configure a reachable P2P advertised endpoint if accepting inbound peers.
    Do not put an RPC/admin endpoint in the peer list.
-5. Keep RPC on localhost. The example permits local administrative operations;
+7. Keep RPC on localhost. The example permits local administrative operations;
    do not expose port 8545 directly to the Internet. Optional gateway tooling
    must be separately configured with method restrictions and HTTPS.
-6. Run `target/release/blq-node full-node --config config/mainnet.toml`.
+8. Run `target/release/blq-node full-node --config config/mainnet.toml`.
 
 The example starts without mining. It uses archive storage with a 100 GiB
 configured cap; account for database overhead and free-space reserve as well.

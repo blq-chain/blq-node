@@ -45,9 +45,9 @@
     {
       "repository": "blq-node",
       "path": "config/mainnet.toml",
-      "sha256": "bc48ca6e85b96df1433fbd5fadf1cd74ee5203cd38a5254c45f31287edb9910d",
+      "sha256": "14f8e4ea286298992798bfbd60d7e93fc64f3b9dc6b158f4553d742a6d879de7",
       "source": "config/mainnet-native-randomx.toml",
-      "sourceSha256": "c4cd13775647cf97d186af5c67587bd482aba1bc2e2b9aa81a824f3639715e4f",
+      "sourceSha256": "8a799c2ab5fe20221caa7b58f0ddf46c8c3c1a9e0eccd21644e94cfdfdc9ffe8",
       "adjustedFromSource": true
     },
     {
@@ -157,9 +157,9 @@
     {
       "repository": "blq-node",
       "path": "crates/blq-node/src/main.rs",
-      "sha256": "f616c40d2a07ed6014e22d33dbf97d7fda9f363a2902a3d056c682fb77067c85",
+      "sha256": "f02b4c125b98c4d9c098e7576f1e3ec1e3fda1934e69f146d5d579a3716e873c",
       "source": "crates/blq-node/src/main.rs",
-      "sourceSha256": "f34999e19ed5e4e089c3c273ab8fc477af332370f6282bb9ac6f724cf87736a9",
+      "sourceSha256": "bc7afee6144edb6fbfa6bbb0dd69715e3631def54c85d245a01f44cfb5837f11",
       "adjustedFromSource": true
     },
     {
@@ -261,7 +261,7 @@
     {
       "repository": "blq-node",
       "path": "docs/setup.md",
-      "sha256": "a0e74c3da295db025269eac5b14c1433d816f0e07a7c60486934ac2ed9c28433",
+      "sha256": "19e3148c89701aff1e16010ad226d25a828fd5c28c0f8f2a5ba10466ab11d0a8",
       "source": null,
       "sourceSha256": null,
       "adjustedFromSource": false
@@ -309,7 +309,7 @@
     {
       "repository": "blq-node",
       "path": "README.md",
-      "sha256": "d381122b6f7fa43c4ea1a8ae674ba939a18a4471adbbaec539d405d413e06188",
+      "sha256": "cdfc1607376e6917f3acbba131b1edfa1b0733d74d1846447f203de3a1350524",
       "source": null,
       "sourceSha256": null,
       "adjustedFromSource": false

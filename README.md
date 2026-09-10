@@ -20,6 +20,10 @@ two public BLQ P2P seed endpoints: `203.159.95.9:30334` and
 `31.76.127.228:30334`. Their P2P TCP reachability was checked on 2026-09-11.
 The node authenticates a seed before accepting data, then uses authenticated
 peer exchange to learn other compatible peers. Never use an RPC port as a peer.
+It saves up to 32 proven peer identities and routes in `data/node/peer-routes.json`
+so it can reconnect after restart; bootstrap seeds remain the fallback.
+`network.max_inbound_peers` defaults to 18, leaving six of the 24 P2P sessions
+available for outbound synchronization and recovery.
 
 Use stable network connectivity and budget disk for the configured archive
 (100 GiB cap in this example), database overhead and filesystem reserve.
