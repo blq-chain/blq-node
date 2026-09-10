@@ -1,0 +1,10 @@
+target/
+.build/
+node_modules/
+data/
+*.sqlite*
+*.log
+.env*
+__pycache__/
+*.exe
+*.dll

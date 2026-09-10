@@ -1,0 +1,37 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      - shell: pwsh
+        run: ./scripts/build-native.ps1
+      - shell: pwsh
+        run: |
+          $env:RANDOMX_LIB_DIR = if ($IsWindows) { "$PWD/.build/RandomX/build/Release" } else { "$PWD/.build/RandomX/build" }
+          $env:RANDOMX_INCLUDE_DIR = "$PWD/.build/RandomX/src"
+          cargo test --locked --workspace --features blq-node/native-randomx
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - shell: pwsh
+        run: |
+          $exe = if ($IsWindows) { 'blq-node.exe' } else { 'blq-node' }
+          $hash = Get-FileHash "target/release/$exe" -Algorithm SHA256
+          "$($hash.Hash.ToLower())  $exe" | Set-Content target/release/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blq-node-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            target/release/blq-node
+            target/release/blq-node.exe
+            target/release/SHA256SUMS

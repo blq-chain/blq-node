@@ -1,0 +1,10 @@
+[Unit]
+Description=BLQ node
+After=network-online.target
+[Service]
+User=blq
+WorkingDirectory=/srv/blq-node
+ExecStart=/srv/blq-node/target/release/blq-node full-node --config /srv/blq-node/config/mainnet.toml
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

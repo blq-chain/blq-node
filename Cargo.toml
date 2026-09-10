@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/blq-consensus", "crates/blq-evm", "crates/blq-mempool", "crates/blq-miner", "crates/blq-network", "crates/blq-node", "crates/blq-pow", "crates/blq-primitives", "crates/blq-rpc", "crates/blq-state", "crates/blq-storage"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://blq-chain.online"
+rust-version = "1.97"
+
+[workspace.dependencies]
+anyhow = "1"
+alloy-primitives = { version = "1.6.0", features = ["rlp", "secp256k1"] }
+alloy-rlp = "0.3.16"
+libc = "0.2"
+base64 = "0.22"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha1 = "0.10"
+getrandom = "0.3"
+secp256k1 = { version = "0.31.1", features = ["recovery"] }
+sha2 = "0.10"
+thiserror = "1"
+toml = "0.8"
+revm = "41.0.0"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+sled = "0.34"
+
+[patch.crates-io]
+ark-relations = { path = "vendor/ark-relations-0.5.1" }

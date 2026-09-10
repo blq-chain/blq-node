@@ -1,0 +1,40 @@
+
+[node]
+mode = "full"
+data_dir = "data/node"
+mining_enabled = false
+block_size_activation_height = 13521
+block_time_v2_activation_height = 14100
+storage_mode = "archive"
+max_storage_bytes = 107374182400
+prune_history = false
+retain_snapshots = true
+retain_finalized_checkpoints = true
+historical_peer_fallback = true
+required_pow_algorithm = "BLQ-RX/2"
+expected_genesis_hash = "79a7f512edc606d2ef444382099b870edc0c4e78b82b8a3d81d758254e49d352"
+genesis_manifest = "config/native-genesis.json"
+require_signed_transactions = true
+
+[rpc]
+enabled = true
+bind = "127.0.0.1:8545"
+public_read_only = false
+max_connections = 64
+
+[network]
+enabled = true
+listen = "0.0.0.0:30333"
+advertise_addr = ""
+bootstrap_peers = ["203.159.95.9:30334", "31.76.127.228:30334"]
+discovery_servers = []
+relay_servers = []
+trusted_peer_keys = []
+
+[discovery]
+enabled = false
+bind = "0.0.0.0:30335"
+
+[relay]
+enabled = false
+bind = "0.0.0.0:30336"

@@ -1,0 +1,38 @@
+[package]
+name = "blq-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+native-randomx = ["blq-pow/native-randomx", "blq-primitives/native-randomx"]
+native-randomx-fast = ["blq-pow/native-randomx-fast"]
+
+[dependencies]
+anyhow.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+libc.workspace = true
+base64.workspace = true
+blq-consensus = { path = "../blq-consensus" }
+blq-evm = { path = "../blq-evm" }
+blq-mempool = { path = "../blq-mempool" }
+blq-miner = { path = "../blq-miner" }
+blq-network = { path = "../blq-network" }
+blq-pow = { path = "../blq-pow" }
+blq-primitives = { path = "../blq-primitives" }
+blq-rpc = { path = "../blq-rpc" }
+blq-storage = { path = "../blq-storage" }
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+secp256k1.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+toml.workspace = true
