@@ -16,6 +16,7 @@ mod native_randomx {
     use blq_primitives::{BlockHeader, Hash256};
     use std::cell::RefCell;
     use std::ffi::c_void;
+    #[cfg(feature = "native-randomx-fast")]
     use std::sync::{OnceLock, RwLock};
 
     const RANDOMX_FLAG_HARD_AES: u32 = 2;
@@ -37,7 +38,7 @@ mod native_randomx {
 
     #[cfg(feature = "native-randomx-fast")]
     struct FastState {
-        key: [u8; 32],
+        key: Vec<u8>,
         cache: *mut RandomXCache,
         dataset: *mut RandomXDataset,
     }
@@ -60,7 +61,7 @@ mod native_randomx {
 
     #[cfg(not(feature = "native-randomx-fast"))]
     struct LightState {
-        key: [u8; 32],
+        key: Vec<u8>,
         cache: *mut RandomXCache,
         vm: *mut RandomXVm,
     }
@@ -145,7 +146,7 @@ mod native_randomx {
                         assert!(!dataset.is_null(), "RandomX dataset allocation failed");
                         randomx_init_dataset(dataset, cache, 0, randomx_dataset_item_count());
                         *state = Some(FastState {
-                            key: key.try_into().expect("RandomX epoch key must be 32 bytes"),
+                            key: key.to_vec(),
                             cache,
                             dataset,
                         });
@@ -174,7 +175,7 @@ mod native_randomx {
                         let vm = randomx_create_vm(cache_flags, cache, std::ptr::null_mut());
                         assert!(!vm.is_null(), "RandomX VM allocation failed");
                         *light_state = Some(LightState {
-                            key: key.try_into().expect("RandomX epoch key must be 32 bytes"),
+                            key: key.to_vec(),
                             cache,
                             vm,
                         });
