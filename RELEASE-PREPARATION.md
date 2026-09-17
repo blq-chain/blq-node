@@ -6,7 +6,7 @@ from isolated staging copies on Windows:
 - Node and miner Rust formatting, locked dependency checks, and workspace tests
   passed.
 - Explorer package installation, tests, and JavaScript syntax checks passed.
-- Website local-link checks passed.
+- Website local-link checks and desktop/mobile browser layout checks passed.
 - The public WebSocket endpoint accepted newHeads, logs, and
   newPendingTransactions subscriptions, then accepted unsubscribe and
   rejected an unsupported subscription.
