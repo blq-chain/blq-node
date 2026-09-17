@@ -355,6 +355,13 @@
     },
     {
       "repository": "blq-node",
+      "path": "RELEASE-PREPARATION.md",
+      "sha256": "a9efde7a948a62fa0d112bb711d0d41605bf31ffd4ba6bb82dbde7627732b323",
+      "source": null,
+      "sourceSha256": null
+    },
+    {
+      "repository": "blq-node",
       "path": ".gitignore",
       "sha256": "5b81e802c0a249c92282e0d3800f130ce18b00cda3599f9750736c0d2aab4da0",
       "source": null,
