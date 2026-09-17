@@ -345,6 +345,159 @@ impl Transaction {
     }
 }
 
+/// Encodes the EIP-1559 payload signed by an externally owned account.
+///
+/// This lives with the transaction model so operational tooling and the node
+/// always produce exactly the same wire payload.
+pub fn eip1559_signing_payload(transaction: &Transaction) -> Result<Vec<u8>, String> {
+    if transaction.transaction_type != 2 {
+        return Err(format!(
+            "expected EIP-1559 transaction type 2, got {}",
+            transaction.transaction_type
+        ));
+    }
+    let recipient = transaction
+        .to
+        .map(|address| address.0.to_vec())
+        .unwrap_or_default();
+    Ok(eip1559_typed_rlp(
+        &[
+            eip1559_rlp_u64(transaction.chain_id),
+            eip1559_rlp_u64(transaction.nonce),
+            eip1559_rlp_u128(transaction.max_priority_fee_per_gas.0),
+            eip1559_rlp_u128(transaction.max_fee_per_gas.0),
+            eip1559_rlp_u64(transaction.gas_limit),
+            eip1559_rlp_bytes(&recipient),
+            eip1559_rlp_u128(transaction.value.0),
+            eip1559_rlp_bytes(&transaction.payload),
+            eip1559_encode_access_list(&transaction.access_list),
+        ]
+        .concat(),
+    ))
+}
+
+/// Encodes a signed EIP-1559 transaction for `eth_sendRawTransaction`.
+pub fn eip1559_signed_bytes(transaction: &Transaction) -> Result<Vec<u8>, String> {
+    if transaction.transaction_type != 2 {
+        return Err(format!(
+            "expected EIP-1559 transaction type 2, got {}",
+            transaction.transaction_type
+        ));
+    }
+    let signature = transaction
+        .signature
+        .as_ref()
+        .ok_or_else(|| "EIP-1559 transaction requires a signature".to_string())?;
+    let recipient = transaction
+        .to
+        .map(|address| address.0.to_vec())
+        .unwrap_or_default();
+    Ok(eip1559_typed_rlp(
+        &[
+            eip1559_rlp_u64(transaction.chain_id),
+            eip1559_rlp_u64(transaction.nonce),
+            eip1559_rlp_u128(transaction.max_priority_fee_per_gas.0),
+            eip1559_rlp_u128(transaction.max_fee_per_gas.0),
+            eip1559_rlp_u64(transaction.gas_limit),
+            eip1559_rlp_bytes(&recipient),
+            eip1559_rlp_u128(transaction.value.0),
+            eip1559_rlp_bytes(&transaction.payload),
+            eip1559_encode_access_list(&transaction.access_list),
+            eip1559_rlp_u64(u64::from(signature.y_parity)),
+            eip1559_rlp_word(signature.r.0),
+            eip1559_rlp_word(signature.s.0),
+        ]
+        .concat(),
+    ))
+}
+
+fn eip1559_encode_access_list(access_list: &[TransactionAccessListItem]) -> Vec<u8> {
+    let entries = access_list
+        .iter()
+        .map(|item| {
+            let keys = eip1559_rlp_list(
+                &item
+                    .storage_keys
+                    .iter()
+                    .map(|key| eip1559_rlp_bytes(&key.0))
+                    .collect::<Vec<_>>(),
+            );
+            eip1559_rlp_list(&[eip1559_rlp_bytes(&item.address.0), keys])
+        })
+        .collect::<Vec<_>>();
+    eip1559_rlp_list(&entries)
+}
+
+fn eip1559_typed_rlp(payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x02];
+    eip1559_rlp_list_payload(payload, &mut out);
+    out
+}
+
+fn eip1559_rlp_list(fields: &[Vec<u8>]) -> Vec<u8> {
+    let payload = fields.concat();
+    let mut out = Vec::new();
+    eip1559_rlp_list_payload(&payload, &mut out);
+    out
+}
+
+fn eip1559_rlp_list_payload(payload: &[u8], out: &mut Vec<u8>) {
+    eip1559_rlp_header(0xc0, payload.len(), out);
+    out.extend_from_slice(payload);
+}
+
+fn eip1559_rlp_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() == 1 && bytes[0] < 0x80 {
+        return vec![bytes[0]];
+    }
+    let mut out = Vec::new();
+    eip1559_rlp_header(0x80, bytes.len(), &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn eip1559_rlp_u64(value: u64) -> Vec<u8> {
+    if value == 0 {
+        return eip1559_rlp_bytes(&[]);
+    }
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(7);
+    eip1559_rlp_bytes(&bytes[first..])
+}
+
+fn eip1559_rlp_u128(value: u128) -> Vec<u8> {
+    if value == 0 {
+        return eip1559_rlp_bytes(&[]);
+    }
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(15);
+    eip1559_rlp_bytes(&bytes[first..])
+}
+
+fn eip1559_rlp_word(value: [u8; 32]) -> Vec<u8> {
+    if value.iter().all(|byte| *byte == 0) {
+        return eip1559_rlp_bytes(&[]);
+    }
+    let first = value.iter().position(|byte| *byte != 0).unwrap_or(31);
+    eip1559_rlp_bytes(&value[first..])
+}
+
+fn eip1559_rlp_header(offset: u8, len: usize, out: &mut Vec<u8>) {
+    if len < 56 {
+        out.push(offset + len as u8);
+        return;
+    }
+    let mut len_bytes = Vec::new();
+    let mut value = len;
+    while value > 0 {
+        len_bytes.push((value & 0xff) as u8);
+        value >>= 8;
+    }
+    len_bytes.reverse();
+    out.push(offset + 55 + len_bytes.len() as u8);
+    out.extend_from_slice(&len_bytes);
+}
+
 impl BlockHeader {
     pub fn beneficiary_address(&self) -> Address {
         Address::from_word(self.beneficiary)
@@ -625,5 +778,31 @@ mod tests {
             word.to_hex(),
             "2222222222222222222222222222222222222222222222222222222222222222"
         );
+    }
+
+    #[test]
+    fn eip1559_encoding_requires_the_expected_type_and_signature() {
+        let transaction = Transaction {
+            chain_id: MAINNET_CHAIN_ID,
+            transaction_type: 2,
+            nonce: 0,
+            from: Address::ZERO,
+            to: Some(Address([0x11; 20])),
+            value: Bix(0),
+            gas_limit: 21_000,
+            max_fee_per_gas: Bix(7),
+            max_priority_fee_per_gas: Bix(0),
+            payload: Vec::new(),
+            access_list: Vec::new(),
+            signature: None,
+            external_hash: None,
+        };
+        let signing = eip1559_signing_payload(&transaction).unwrap();
+        assert_eq!(signing[0], 0x02);
+        assert!(eip1559_signed_bytes(&transaction).is_err());
+
+        let mut wrong_type = transaction.clone();
+        wrong_type.transaction_type = 1;
+        assert!(eip1559_signing_payload(&wrong_type).is_err());
     }
 }

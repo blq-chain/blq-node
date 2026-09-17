@@ -13,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
-UPSTREAM = os.environ.get("BLQ_UPSTREAM", "http://127.0.0.1:8545")
+UPSTREAM = os.environ.get("BLQ_UPSTREAM", "http://192.0.2.39:8545")
 UPSTREAMS = tuple(
     value.strip()
     for value in os.environ.get("BLQ_UPSTREAMS", UPSTREAM).split(",")
@@ -40,6 +40,7 @@ MAX_INFLIGHT = int(os.environ.get("BLQ_MAX_INFLIGHT", "32"))
 READ_MAX_INFLIGHT = int(os.environ.get("BLQ_READ_MAX_INFLIGHT", "24"))
 TRANSACTION_MAX_INFLIGHT = int(os.environ.get("BLQ_TRANSACTION_MAX_INFLIGHT", "4"))
 MINING_MAX_INFLIGHT = int(os.environ.get("BLQ_MINING_MAX_INFLIGHT", "2"))
+TELEMETRY_MAX_INFLIGHT = int(os.environ.get("BLQ_TELEMETRY_MAX_INFLIGHT", "4"))
 RATE = 10.0
 BURST = 20.0
 UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("BLQ_UPSTREAM_TIMEOUT_SECONDS", "4"))
@@ -82,10 +83,12 @@ PUBLIC_METHODS = {
     "blq_chainInfo",
     "blq_health",
     "blq_nodeInfo",
+    "blq_pendingTransactions",
     "blq_powSpec",
 }
 MINING_METHODS = {"blq_getBlockTemplate", "blq_submitBlock"}
 TRANSACTION_METHODS = {"eth_sendRawTransaction"}
+TELEMETRY_METHODS = {"blq_reportHashrate"}
 # Mining is permissionless at the public edge.  The node still performs full
 # PoW/block validation; this gateway only bounds request volume and size.
 # Keep accepting the legacy header so private deployments can migrate without
@@ -99,6 +102,7 @@ _inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
 _read_inflight = threading.BoundedSemaphore(READ_MAX_INFLIGHT)
 _transaction_inflight = threading.BoundedSemaphore(TRANSACTION_MAX_INFLIGHT)
 _mining_inflight = threading.BoundedSemaphore(MINING_MAX_INFLIGHT)
+_telemetry_inflight = threading.BoundedSemaphore(TELEMETRY_MAX_INFLIGHT)
 HTTP_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("BLQ_HTTP_SOCKET_TIMEOUT_SECONDS", "15"))
 RELAY_QUEUE_SIZE = int(os.environ.get("BLQ_RELAY_QUEUE_SIZE", "128"))
 RELAY_WORKERS = int(os.environ.get("BLQ_RELAY_WORKERS", "2"))
@@ -146,7 +150,7 @@ def error(request_id, code, message):
 
 
 def method_allowed(method, mining_token):
-    if method in PUBLIC_METHODS or method in MINING_METHODS:
+    if method in PUBLIC_METHODS or method in MINING_METHODS or method in TELEMETRY_METHODS:
         return True
     return False
 
@@ -498,6 +502,7 @@ class Handler(BaseHTTPRequestHandler):
         mining_slot = False
         read_slot = False
         transaction_slot = False
+        telemetry_slot = False
         try:
             client = self.headers.get("X-Real-IP", self.client_address[0])
             if not allowed(client):
@@ -535,7 +540,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 mining_slot = True
             transaction_request = any(item.get("method") in TRANSACTION_METHODS for item in requests)
-            if not transaction_request and not any(item.get("method") in MINING_METHODS for item in requests):
+            telemetry_request = any(item.get("method") in TELEMETRY_METHODS for item in requests)
+            if telemetry_request and len(requests) != 1:
+                self.send_json(error(None, -32600, "hashrate telemetry must be sent alone"), 400)
+                return
+            if telemetry_request:
+                if not _telemetry_inflight.acquire(blocking=False):
+                    self.send_json(error(None, -32005, "public telemetry RPC is busy"), 503)
+                    return
+                telemetry_slot = True
+            if not transaction_request and not telemetry_request and not any(item.get("method") in MINING_METHODS for item in requests):
                 if not _read_inflight.acquire(blocking=False):
                     self.send_json(error(None, -32005, "public RPC read capacity is busy"), 503)
                     return
@@ -551,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 request,
                 mining=any(item.get("method") in MINING_METHODS for item in requests),
                 transaction=transaction_request,
+                upstreams=MINING_UPSTREAMS if telemetry_request else None,
             )
             if not body:
                 self.send_response(204)
@@ -570,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
                 _mining_inflight.release()
             if transaction_slot:
                 _transaction_inflight.release()
+            if telemetry_slot:
+                _telemetry_inflight.release()
             if read_slot:
                 _read_inflight.release()
             _inflight.release()

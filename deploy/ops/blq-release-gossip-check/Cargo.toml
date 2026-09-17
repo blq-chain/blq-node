@@ -1,0 +1,19 @@
+[package]
+name = "blq-release-gossip-check"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+alloy-primitives.workspace = true
+blq-primitives = { path = "../../../crates/blq-primitives" }
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true

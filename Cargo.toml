@@ -1,12 +1,12 @@
 [workspace]
-members = ["crates/blq-consensus", "crates/blq-evm", "crates/blq-mempool", "crates/blq-miner", "crates/blq-network", "crates/blq-node", "crates/blq-pow", "crates/blq-primitives", "crates/blq-rpc", "crates/blq-state", "crates/blq-storage"]
+members = ["crates/blq-consensus", "crates/blq-evm", "crates/blq-mempool", "crates/blq-miner", "crates/blq-network", "crates/blq-node", "crates/blq-pow", "crates/blq-primitives", "crates/blq-rpc", "crates/blq-state", "crates/blq-storage", "deploy/ops/blq-release-gossip-check"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://blq-chain.online"
-rust-version = "1.97"
+rust-version = "1.78"
 
 [workspace.dependencies]
 anyhow = "1"

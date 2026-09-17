@@ -68,6 +68,9 @@ const MAX_P2P_MESSAGES_PER_CONNECTION: usize = 1_024;
 const MAX_TRANSACTION_GOSSIP_QUEUE: usize = 512;
 const TRANSACTION_GOSSIP_WORKERS: usize = 2;
 const TRANSACTION_GOSSIP_INVENTORY_TTL_SECONDS: u64 = 10 * 60;
+const MAX_BLOCK_GOSSIP_QUEUE: usize = 64;
+const BLOCK_GOSSIP_WORKERS: usize = 2;
+const BLOCK_GOSSIP_INVENTORY_TTL_SECONDS: u64 = 2 * 60;
 const MEMPOOL_TRANSACTION_EXPIRY_SECONDS: u64 = 2 * 60 * 60;
 const MAX_P2P_BODY_REQUESTS_PER_CONNECTION: usize = 256;
 // A recovery batch must be substantially larger than normal block production.
@@ -209,6 +212,12 @@ static TRANSACTION_GOSSIP_INVENTORY: OnceLock<Mutex<BTreeMap<Hash256, u64>>> = O
 static TRANSACTION_GOSSIP_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_GOSSIP_RELAYED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_GOSSIP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_GOSSIP_QUEUE: OnceLock<SyncSender<BlockGossipJob>> = OnceLock::new();
+static BLOCK_GOSSIP_INVENTORY: OnceLock<Mutex<BTreeMap<Hash256, u64>>> = OnceLock::new();
+static BLOCK_GOSSIP_RELAYED: AtomicU64 = AtomicU64::new(0);
+static BLOCK_GOSSIP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_GOSSIP_DEDUPLICATED: AtomicU64 = AtomicU64::new(0);
+static LAST_BLOCK_GOSSIP_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DISCOVERED_PEER_ROUTES: OnceLock<Mutex<BTreeMap<String, PeerRecord>>> = OnceLock::new();
 static ACTIVE_DISCOVERY_ROUTES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 const MAX_DISCOVERY_WORKERS: usize = 16;
@@ -218,6 +227,14 @@ struct TransactionGossipJob {
     config: NodeConfig,
     storage: Arc<Mutex<NodeStorage>>,
     transaction: Transaction,
+}
+
+#[derive(Clone)]
+struct BlockGossipJob {
+    config: NodeConfig,
+    genesis_hash: Hash256,
+    block: Block,
+    source_peer: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2805,6 +2822,11 @@ fn p2p_session_status() -> serde_json::Value {
         .lock()
         .ok()
         .and_then(|error| error.clone());
+    let last_block_gossip_error = LAST_BLOCK_GOSSIP_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|error| error.clone());
     serde_json::json!({
         "activeP2pConnections": active,
         "cachedPeerCount": cached_peer_routes()
@@ -2818,6 +2840,10 @@ fn p2p_session_status() -> serde_json::Value {
         "closedRpcConnections": CLOSED_RPC_CONNECTIONS.load(Ordering::Acquire),
         "lastP2pHandlerError": last_p2p_error,
         "lastRpcHandlerError": last_rpc_error,
+        "blockAnnouncementsRelayed": BLOCK_GOSSIP_RELAYED.load(Ordering::Relaxed),
+        "blockAnnouncementFailures": BLOCK_GOSSIP_FAILURES.load(Ordering::Relaxed),
+        "blockAnnouncementsDeduplicated": BLOCK_GOSSIP_DEDUPLICATED.load(Ordering::Relaxed),
+        "lastBlockAnnouncementError": last_block_gossip_error,
         "closeWaitThreshold": P2P_CLOSE_WAIT_THRESHOLD,
         "syncSessionAge": if started_at == 0 { serde_json::Value::Null } else { serde_json::json!(now.saturating_sub(started_at)) },
         "degraded": active >= P2P_CLOSE_WAIT_THRESHOLD,
@@ -6212,9 +6238,7 @@ fn rpc_submit_block(
                 let storage = storage_arc.lock().expect("storage mutex poisoned");
                 configured_genesis_hash(&storage).unwrap_or_else(|_| genesis_header().hash())
             };
-            if let Err(err) = relay_block_to_peers(config, genesis_hash, &block) {
-                eprintln!("p2p relay after competing submit failed: {err}");
-            }
+            enqueue_block_gossip(config, genesis_hash, &block, None);
             let storage = storage_arc.lock().expect("storage mutex poisoned");
             let current = match storage.best_header() {
                 Ok(header) => header,
@@ -6289,9 +6313,7 @@ fn rpc_submit_block(
         let storage = storage_arc.lock().expect("storage mutex poisoned");
         configured_genesis_hash(&storage).unwrap_or_else(|_| genesis_header().hash())
     };
-    if let Err(err) = relay_block_to_peers(config, genesis_hash, &accepted_block) {
-        eprintln!("p2p relay after submit failed: {err}");
-    }
+    enqueue_block_gossip(config, genesis_hash, &accepted_block, None);
     rpc_result(
         id,
         serde_json::json!({
@@ -9055,21 +9077,7 @@ fn transaction_signing_payload(transaction: &Transaction) -> Result<Vec<u8>> {
             ]
             .concat(),
         )),
-        2 => Ok(encode_typed_rlp(
-            0x02,
-            &[
-                rlp_encode_u64(transaction.chain_id),
-                rlp_encode_u64(transaction.nonce),
-                rlp_encode_u128(transaction.max_priority_fee_per_gas.0),
-                rlp_encode_u128(transaction.max_fee_per_gas.0),
-                rlp_encode_u64(transaction.gas_limit),
-                rlp_encode_bytes(&recipient),
-                rlp_encode_u128(transaction.value.0),
-                rlp_encode_bytes(&transaction.payload),
-                access_list,
-            ]
-            .concat(),
-        )),
+        2 => blq_primitives::eip1559_signing_payload(transaction).map_err(anyhow::Error::msg),
         0 => {
             let fields = [
                 rlp_encode_u64(transaction.nonce),
@@ -9135,24 +9143,7 @@ fn transaction_signed_bytes(transaction: &Transaction) -> Result<Vec<u8>> {
             ]
             .concat(),
         )),
-        2 => Ok(encode_typed_rlp(
-            0x02,
-            &[
-                rlp_encode_u64(transaction.chain_id),
-                rlp_encode_u64(transaction.nonce),
-                rlp_encode_u128(transaction.max_priority_fee_per_gas.0),
-                rlp_encode_u128(transaction.max_fee_per_gas.0),
-                rlp_encode_u64(transaction.gas_limit),
-                rlp_encode_bytes(&recipient),
-                rlp_encode_u128(transaction.value.0),
-                rlp_encode_bytes(&transaction.payload),
-                access_list,
-                rlp_encode_u64(u64::from(signature.y_parity)),
-                r,
-                s,
-            ]
-            .concat(),
-        )),
+        2 => blq_primitives::eip1559_signed_bytes(transaction).map_err(anyhow::Error::msg),
         0 => {
             let fields = [
                 rlp_encode_u64(transaction.nonce),
@@ -11614,6 +11605,7 @@ fn run_p2p(
 ) -> Result<()> {
     let (tls_config, tls_certificate_hash) = build_server_tls_config()?;
     start_transaction_gossip_workers();
+    start_block_gossip_workers();
     // Restored entries are revalidated during startup and then enter the same
     // bounded gossip queue as new submissions. This lets a non-mining node
     // recover propagation after a restart without rewriting transaction age.
@@ -11847,6 +11839,105 @@ fn start_transaction_gossip_workers() {
     for _ in 0..TRANSACTION_GOSSIP_WORKERS {
         let receiver = Arc::clone(&receiver);
         thread::spawn(move || transaction_gossip_worker(receiver));
+    }
+}
+
+fn start_block_gossip_workers() {
+    if BLOCK_GOSSIP_QUEUE.get().is_some() {
+        return;
+    }
+    let (sender, receiver) = mpsc::sync_channel::<BlockGossipJob>(MAX_BLOCK_GOSSIP_QUEUE);
+    if BLOCK_GOSSIP_QUEUE.set(sender).is_err() {
+        return;
+    }
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..BLOCK_GOSSIP_WORKERS {
+        let receiver = Arc::clone(&receiver);
+        thread::spawn(move || block_gossip_worker(receiver));
+    }
+}
+
+fn block_gossip_worker(receiver: Arc<Mutex<Receiver<BlockGossipJob>>>) {
+    loop {
+        let job = {
+            let receiver = receiver.lock().expect("block gossip queue poisoned");
+            receiver.recv()
+        };
+        let Ok(job) = job else { break };
+        let hash = job.block.header.hash();
+        if !mark_block_gossip_seen(hash, unix_now()) {
+            BLOCK_GOSSIP_DEDUPLICATED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        match relay_block_to_peers(
+            &job.config,
+            job.genesis_hash,
+            &job.block,
+            job.source_peer.as_deref(),
+        ) {
+            Ok(()) => {
+                BLOCK_GOSSIP_RELAYED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                BLOCK_GOSSIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+                *LAST_BLOCK_GOSSIP_ERROR
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("block gossip error mutex poisoned") = Some(err.to_string());
+                eprintln!("p2p block relay failed: {err}");
+            }
+        }
+    }
+}
+
+fn mark_block_gossip_seen(hash: Hash256, now: u64) -> bool {
+    let inventory = BLOCK_GOSSIP_INVENTORY.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut inventory = inventory.lock().expect("block gossip inventory poisoned");
+    inventory.retain(|_, seen| now.saturating_sub(*seen) < BLOCK_GOSSIP_INVENTORY_TTL_SECONDS);
+    if inventory.contains_key(&hash) {
+        return false;
+    }
+    inventory.insert(hash, now);
+    true
+}
+
+fn enqueue_block_gossip(
+    config: &NodeConfig,
+    genesis_hash: Hash256,
+    block: &Block,
+    source_peer: Option<&str>,
+) {
+    if !config.network.enabled {
+        return;
+    }
+    let Some(queue) = BLOCK_GOSSIP_QUEUE.get() else {
+        return;
+    };
+    let job = BlockGossipJob {
+        config: config.clone(),
+        genesis_hash,
+        block: block.clone(),
+        source_peer: source_peer.map(str::to_string),
+    };
+    match queue.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            BLOCK_GOSSIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            *LAST_BLOCK_GOSSIP_ERROR
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("block gossip error mutex poisoned") =
+                Some("block announcement queue is full".to_string());
+            eprintln!("p2p block announcement queue full; sync polling remains available");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            BLOCK_GOSSIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            *LAST_BLOCK_GOSSIP_ERROR
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("block gossip error mutex poisoned") =
+                Some("block announcement queue is unavailable".to_string());
+        }
     }
 }
 
@@ -12845,13 +12936,14 @@ fn sync_with_peer(
                                     _ => unreachable!("checked recovery body"),
                                 }
                             } else {
-                                handle_p2p_message(
+                                handle_p2p_message_from(
                                     reader.get_mut(),
                                     config,
                                     &storage,
                                     &mempool,
                                     message,
                                     Some(&peer_tls_certificate_hash),
+                                    Some(peer),
                                 )
                             };
                             match import_result {
@@ -13444,7 +13536,7 @@ fn poll_relay_server(
                         handle_relay_header(config, storage, mempool, header)
                     }
                     P2pMessage::BlockBody { block } => {
-                        import_network_block(config, storage, mempool, block)
+                        import_network_block(config, storage, mempool, block, None)
                     }
                     _ => anyhow::bail!("relay returned a non-block payload"),
                 };
@@ -13495,7 +13587,7 @@ fn handle_relay_header(
         .take(MAX_RPC_BODY_FETCH_PEERS)
     {
         match fetch_rpc_block_body(config, storage, peer, header.number.0, expected_hash) {
-            Ok(block) => return import_network_block(config, storage, mempool, block),
+            Ok(block) => return import_network_block(config, storage, mempool, block, None),
             Err(err) => eprintln!("relay header body fetch from {peer} failed: {err}"),
         }
     }
@@ -13613,13 +13705,14 @@ where
             "p2p inbound received {} from {peer_address}",
             p2p_message_kind(&message)
         );
-        match handle_p2p_message(
+        match handle_p2p_message_from(
             reader.get_mut(),
             config,
             &storage,
             &mempool,
             message,
             expected_tls_certificate_hash,
+            Some(&peer_address),
         ) {
             Ok(()) => {
                 if matches!(agreement_message, P2pMessage::Hello { .. }) {
@@ -14011,6 +14104,26 @@ fn handle_p2p_message<S: Write>(
     message: P2pMessage,
     expected_tls_certificate_hash: Option<&str>,
 ) -> Result<()> {
+    handle_p2p_message_from(
+        stream,
+        config,
+        storage,
+        mempool,
+        message,
+        expected_tls_certificate_hash,
+        None,
+    )
+}
+
+fn handle_p2p_message_from<S: Write>(
+    stream: &mut S,
+    config: &NodeConfig,
+    storage: &Arc<Mutex<NodeStorage>>,
+    mempool: &Arc<Mutex<Mempool>>,
+    message: P2pMessage,
+    expected_tls_certificate_hash: Option<&str>,
+    source_peer: Option<&str>,
+) -> Result<()> {
     let expected_profile = {
         let storage = storage.lock().expect("storage mutex poisoned");
         network_consensus_profile(config, configured_genesis_hash(&storage)?)
@@ -14178,7 +14291,9 @@ fn handle_p2p_message<S: Write>(
             };
             send_p2p_message(stream, &P2pMessage::Transaction { data })
         }
-        P2pMessage::BlockBody { block } => import_network_block(config, storage, mempool, block),
+        P2pMessage::BlockBody { block } => {
+            import_network_block(config, storage, mempool, block, source_peer)
+        }
         P2pMessage::BlockNotFound { .. } => Ok(()),
         P2pMessage::Transaction { .. } => anyhow::bail!("unexpected transaction response"),
         P2pMessage::NewTransaction { transaction } => {
@@ -14319,6 +14434,7 @@ fn import_network_block(
     storage: &Arc<Mutex<NodeStorage>>,
     mempool: &Arc<Mutex<Mempool>>,
     block: blq_primitives::Block,
+    source_peer: Option<&str>,
 ) -> Result<()> {
     if config.node.mode != NodeMode::Full {
         return Ok(());
@@ -14374,7 +14490,7 @@ fn import_network_block(
                     .map(|transaction| transaction.hash())
             })
             .collect::<Vec<_>>();
-        match stage_and_publish_candidate(config, storage, branch) {
+        let published = match stage_and_publish_candidate(config, storage, branch) {
             Ok(()) => {
                 if !included_hashes.is_empty() {
                     mempool
@@ -14382,20 +14498,20 @@ fn import_network_block(
                         .expect("mempool mutex poisoned")
                         .remove_included(&included_hashes);
                 }
+                true
             }
-            Err(err) => eprintln!("candidate import deferred; active chain unchanged: {err}"),
-        }
+            Err(err) => {
+                eprintln!("candidate import deferred; active chain unchanged: {err}");
+                false
+            }
+        };
         let genesis_hash = {
             let storage_guard = storage.lock().expect("storage mutex poisoned");
             configured_genesis_hash(&storage_guard).unwrap_or_else(|_| genesis_header().hash())
         };
-        let relay_config = config.clone();
-        let relay_block = block.clone();
-        thread::spawn(move || {
-            if let Err(err) = relay_block_to_peers(&relay_config, genesis_hash, &relay_block) {
-                eprintln!("p2p relay after candidate import failed: {err}");
-            }
-        });
+        if published {
+            enqueue_block_gossip(config, genesis_hash, &block, source_peer);
+        }
         return Ok(());
     }
     let mut storage_guard = storage.lock().expect("storage mutex poisoned");
@@ -14451,9 +14567,11 @@ fn import_network_block(
         imported_block.header.number.0,
         imported_block.header.number.0,
     );
-    // This block arrived from an authenticated peer. Do not spawn an
-    // unbounded relay thread for every imported block; the normal peer
-    // notification path handles propagation and keeps RPC capacity bounded.
+    let genesis_hash = {
+        let storage = storage.lock().expect("storage mutex poisoned");
+        configured_genesis_hash(&storage).unwrap_or_else(|_| genesis_header().hash())
+    };
+    enqueue_block_gossip(config, genesis_hash, &imported_block, source_peer);
     drop(import_guard);
     Ok(())
 }
@@ -16736,15 +16854,22 @@ fn relay_best_header(config: &NodeConfig, storage: &NodeStorage) -> Result<()> {
     }
     let header = storage.best_header()?;
     let block = storage.block_by_number(header.number.0)?;
-    relay_block_to_peers(config, configured_genesis_hash(storage)?, &block)
+    enqueue_block_gossip(config, configured_genesis_hash(storage)?, &block, None);
+    Ok(())
 }
 
-fn relay_block_to_peers(config: &NodeConfig, genesis_hash: Hash256, block: &Block) -> Result<()> {
+fn relay_block_to_peers(
+    config: &NodeConfig,
+    genesis_hash: Hash256,
+    block: &Block,
+    source_peer: Option<&str>,
+) -> Result<()> {
     if !config.network.enabled {
         return Ok(());
     }
     let header = block.header.clone();
     let mut peers = config.network.bootstrap_peers.clone();
+    peers.extend(cached_peer_endpoints());
     if let Some(routes) = DISCOVERED_PEER_ROUTES.get() {
         peers.extend(
             routes
@@ -16754,57 +16879,84 @@ fn relay_block_to_peers(config: &NodeConfig, genesis_hash: Hash256, block: &Bloc
                 .map(|peer| peer.address.clone()),
         );
     }
+    let source_identity = source_peer.and_then(|peer| {
+        known_peer_identities()
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(peer).cloned())
+    });
+    peers = peers
+        .into_iter()
+        .map(|peer| preferred_peer_route(&peer).unwrap_or(peer))
+        .filter(|peer| {
+            source_peer.is_none_or(|source| source != peer)
+                && source_identity.as_ref().is_none_or(|identity| {
+                    known_peer_identities()
+                        .lock()
+                        .ok()
+                        .and_then(|identities| identities.get(peer).cloned())
+                        .as_ref()
+                        != Some(identity)
+                })
+        })
+        .collect();
     peers.sort();
     peers.dedup();
     for peer in &peers {
-        match connect_p2p_tls(peer) {
-            Ok((mut stream, peer_tls_certificate_hash)) => {
-                send_p2p_message(
-                    &mut stream,
-                    &hello_message_from_best_header_with_genesis(
-                        config,
-                        &header,
-                        &peer_tls_certificate_hash,
-                        genesis_hash,
-                    )?,
-                )?;
-                let mut reader = BufReader::new(P2pShutdownGuard::new_configured(stream)?);
-                let mut line = String::new();
-                if !read_p2p_line(&mut reader, &mut line)? {
-                    anyhow::bail!("P2P relay peer closed before hello");
-                }
-                match serde_json::from_str(line.trim())? {
-                    P2pMessage::Hello {
-                        node_mode,
-                        best_number,
-                        best_hash,
-                        consensus_profile,
-                        identity_public_key,
-                        identity_signature,
-                        tls_certificate_hash,
-                    } => verify_p2p_identity_with_profile(
-                        node_mode,
-                        best_number,
-                        &best_hash,
-                        &consensus_profile,
-                        &identity_public_key,
-                        &identity_signature,
-                        &tls_certificate_hash,
-                        Some(&peer_tls_certificate_hash),
-                        (!config.network.trusted_peer_keys.is_empty())
-                            .then_some(config.network.trusted_peer_keys.as_slice()),
-                        &network_consensus_profile(config, genesis_hash),
-                    )?,
-                    _ => anyhow::bail!("P2P relay peer did not send hello first"),
-                }
-                send_p2p_message(
-                    reader.get_mut(),
-                    &P2pMessage::BlockBody {
-                        block: block.clone(),
-                    },
-                )?;
+        let relay_result = (|| -> Result<()> {
+            let (mut stream, peer_tls_certificate_hash) = connect_p2p_tls(peer)?;
+            send_p2p_message(
+                &mut stream,
+                &hello_message_from_best_header_with_genesis(
+                    config,
+                    &header,
+                    &peer_tls_certificate_hash,
+                    genesis_hash,
+                )?,
+            )?;
+            let mut reader = BufReader::new(P2pShutdownGuard::new_configured(stream)?);
+            let mut line = String::new();
+            if !read_p2p_line(&mut reader, &mut line)? {
+                anyhow::bail!("P2P relay peer closed before hello");
             }
-            Err(err) => eprintln!("p2p relay to {peer} failed: {err}"),
+            match serde_json::from_str(line.trim())? {
+                P2pMessage::Hello {
+                    node_mode,
+                    best_number,
+                    best_hash,
+                    consensus_profile,
+                    identity_public_key,
+                    identity_signature,
+                    tls_certificate_hash,
+                } => verify_p2p_identity_with_profile(
+                    node_mode,
+                    best_number,
+                    &best_hash,
+                    &consensus_profile,
+                    &identity_public_key,
+                    &identity_signature,
+                    &tls_certificate_hash,
+                    Some(&peer_tls_certificate_hash),
+                    (!config.network.trusted_peer_keys.is_empty())
+                        .then_some(config.network.trusted_peer_keys.as_slice()),
+                    &network_consensus_profile(config, genesis_hash),
+                )?,
+                _ => anyhow::bail!("P2P relay peer did not send hello first"),
+            }
+            send_p2p_message(
+                reader.get_mut(),
+                &P2pMessage::BlockBody {
+                    block: block.clone(),
+                },
+            )
+        })();
+        if let Err(err) = relay_result {
+            BLOCK_GOSSIP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            *LAST_BLOCK_GOSSIP_ERROR
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("block gossip error mutex poisoned") = Some(err.to_string());
+            eprintln!("p2p block announcement to {peer} failed: {err}");
         }
     }
     broadcast_relay_block(config, block)?;
@@ -17090,6 +17242,28 @@ fn is_peer_disconnect(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_gossip_inventory_deduplicates_until_expiry() {
+        let _test_guard = SOCKET_COUNTER_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("socket counter test mutex poisoned");
+        let hash = genesis_header().hash();
+        let now = unix_now();
+        BLOCK_GOSSIP_INVENTORY
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("block gossip inventory poisoned")
+            .clear();
+
+        assert!(mark_block_gossip_seen(hash, now));
+        assert!(!mark_block_gossip_seen(hash, now.saturating_add(1)));
+        assert!(mark_block_gossip_seen(
+            hash,
+            now.saturating_add(BLOCK_GOSSIP_INVENTORY_TTL_SECONDS + 1)
+        ));
+    }
 
     #[test]
     fn native_accounts_are_visible_to_evm_state() {
@@ -19496,6 +19670,14 @@ mod tests {
         transaction.external_hash = Some(Hash256(
             keccak256(transaction_signed_bytes(&transaction).expect("wire bytes")).0,
         ));
+        let raw = format!(
+            "0x{}",
+            hex::encode(transaction_signed_bytes(&transaction).expect("wire bytes"))
+        );
+        let decoded = decode_raw_transaction(&raw).expect("decode primitive EIP-1559 wire bytes");
+        assert_eq!(decoded.from, sender);
+        assert_eq!(decoded.nonce, 0);
+        assert_eq!(decoded.external_hash, transaction.external_hash);
         let mut forged = transaction.clone();
         forged.from = Address([0x44; 20]);
         let mut output = Vec::new();

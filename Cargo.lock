@@ -854,6 +854,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "blq-release-gossip-check"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "blq-primitives",
+ "clap",
+ "getrandom 0.3.4",
+ "hex",
+ "secp256k1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "blq-rpc"
 version = "0.1.0"
 dependencies = [

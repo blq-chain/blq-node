@@ -198,29 +198,7 @@ mod native_randomx {
 
         #[test]
         fn matches_upstream_api_example_vector() {
-            // The upstream vector has a short key, unlike BLQ's 32-byte epoch key.
-            // Exercise the native ABI directly without the BLQ epoch cache.
-            let key = b"RandomX example key\0";
-            let input = b"RandomX example input\0";
-            let mut output = [0u8; 32];
-            unsafe {
-                let cache = randomx_alloc_cache(0);
-                assert!(!cache.is_null());
-                randomx_init_cache(cache, key.as_ptr().cast(), key.len());
-                let vm = randomx_create_vm(0, cache, std::ptr::null_mut());
-                if vm.is_null() {
-                    randomx_release_cache(cache);
-                    panic!("RandomX test VM allocation failed");
-                }
-                randomx_calculate_hash(
-                    vm,
-                    input.as_ptr().cast(),
-                    input.len(),
-                    output.as_mut_ptr().cast(),
-                );
-                randomx_destroy_vm(vm);
-                randomx_release_cache(cache);
-            }
+            let output = hash_keyed(b"RandomX example key\0", b"RandomX example input\0");
             assert_eq!(
                 Hash256(output).to_hex(),
                 "8a48e5f9db45ab79d9080574c4d81954fe6ac63842214aff73c244b26330b7c9"

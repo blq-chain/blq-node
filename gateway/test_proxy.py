@@ -46,6 +46,12 @@ class PublicRpcPolicyTests(unittest.TestCase):
     def test_node_identity_method_is_public(self):
         self.assertTrue(method_allowed("blq_nodeInfo", ""))
 
+    def test_bounded_pending_transactions_view_is_public(self):
+        self.assertTrue(method_allowed("blq_pendingTransactions", ""))
+
+    def test_hashrate_telemetry_is_public(self):
+        self.assertTrue(method_allowed("blq_reportHashrate", ""))
+
     def test_node_info_hides_peer_routes_and_recovery_details(self):
         response = sanitize_public_rpc_response(
             {"jsonrpc": "2.0", "id": 9, "method": "blq_nodeInfo", "params": []},
@@ -90,6 +96,15 @@ class PublicRpcPolicyTests(unittest.TestCase):
         finally:
             if first:
                 proxy._mining_inflight.release()
+
+    def test_hashrate_telemetry_capacity_is_bounded_separately(self):
+        first = proxy._telemetry_inflight.acquire(blocking=False)
+        self.assertTrue(first)
+        try:
+            self.assertGreaterEqual(proxy.TELEMETRY_MAX_INFLIGHT, 1)
+        finally:
+            if first:
+                proxy._telemetry_inflight.release()
 
     def test_json_rpc_envelope_requires_version_and_method(self):
         self.assertTrue(valid_envelope({"jsonrpc": "2.0", "method": "eth_chainId"}))
