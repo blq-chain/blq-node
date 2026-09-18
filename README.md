@@ -3,7 +3,7 @@
 BLQ is a custom Proof-of-Work blockchain. Chain ID: 707070. Genesis:
 `79a7f512edc606d2ef444382099b870edc0c4e78b82b8a3d81d758254e49d352`.
 The mainnet profile uses BLQ-RX/2, time-based issuance of 0.1 BLQ/minute,
-and block-time V2 activation at 14100 with a 15-second target.
+and a 15-second block-time target.
 
 ## Build and run
 
