@@ -2892,18 +2892,22 @@ impl Drop for SyncIdentityLease {
     }
 }
 
-/// A branch is fetched by one provider route at a time. The cursor is shared
-/// across routes, so a second peer is failover rather than duplicate work.
+/// A node imports at most one forward recovery range at a time. The cursor key
+/// follows a moving provider tip, so it cannot itself be the lease key: moving
+/// it would allow a second route to acquire a differently named lease for the
+/// same spool and race the ordered body stream.
+const FORWARD_RECOVERY_LEASE_KEY: &str = "forward-recovery";
+
 struct RecoveryJobLease(Option<String>);
 
 impl RecoveryJobLease {
-    fn acquire(job: &str) -> Option<Self> {
+    fn acquire(_job: &str) -> Option<Self> {
         let mut active = active_recovery_jobs()
             .lock()
             .expect("active recovery jobs mutex poisoned");
         active
-            .insert(job.to_string())
-            .then(|| Self(Some(job.to_string())))
+            .insert(FORWARD_RECOVERY_LEASE_KEY.to_string())
+            .then(|| Self(Some(FORWARD_RECOVERY_LEASE_KEY.to_string())))
     }
 }
 
@@ -20881,6 +20885,7 @@ mod tests {
         let job = format!("recovery-job-lease-{}", unix_now());
         let first = RecoveryJobLease::acquire(&job).expect("first recovery lease");
         assert!(RecoveryJobLease::acquire(&job).is_none());
+        assert!(RecoveryJobLease::acquire("another-moving-tip").is_none());
         drop(first);
         assert!(RecoveryJobLease::acquire(&job).is_some());
     }
