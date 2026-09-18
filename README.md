@@ -27,6 +27,18 @@ Hardware minima require measurement; no unsupported minimum is promised.
 Keep database data outside Git. Check node status, disk reserve and sync before
 enabling any mining templates. Preserve data and config on upgrades.
 
+## Recovery behavior
+
+Forward recovery uses one active ordered range provider per node. When another
+authenticated peer advertises a moving tip, it remains available as a witness
+or failover route instead of starting a competing range download against the
+same durable recovery cursor. This prevents valid range responses from being
+discarded when concurrent providers race the cursor.
+
+The v0.1.2 recovery update changes node synchronization only. It does not
+change chain ID, genesis, BLQ-RX/2 Proof of Work, transaction rules, mining
+selection, account state, or canonical fork choice.
+
 ## Optional gateway
 
 `gateway/` contains the public RPC edge and policy tests. Configure
@@ -37,10 +49,11 @@ Documentation addresses in defaults are placeholders. Run
 
 ## Release source status
 
-This is the BLQ v0.1.0 public release source snapshot. `RELEASE-v0.1.0.md`
-records supported public interfaces, validation scope, and known limitations.
-`source-manifest.json` records the exact exported file hashes. This source
-release is not an independent security audit.
+This repository contains the v0.1.0 public source snapshot, the v0.1.1 native
+RandomX cache correction, and the v0.1.2 recovery update. See
+`RELEASE-v0.1.2.md` for the current patch scope; earlier release records remain
+available for provenance. `source-manifest.json` records the original exported
+snapshot hashes. This source release is not an independent security audit.
 
 ## Public services
 
