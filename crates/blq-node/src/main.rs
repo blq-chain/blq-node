@@ -2718,6 +2718,23 @@ fn reconcile_forward_recovery_spool(
     Ok(())
 }
 
+fn recovery_progress_timed_out(has_recovery_job: bool, elapsed: Duration) -> bool {
+    has_recovery_job && elapsed >= RECOVERY_NO_PROGRESS_TIMEOUT
+}
+
+/// A durable branch has exactly one ordered range provider. A route that
+/// advertises a different moving tip may still become a failover provider once
+/// the active session ends, but must not start a second range while that lease
+/// is held. Otherwise both streams race the shared cursor and invalidate one
+/// another as stale responses.
+fn recovery_provider_is_deferred(
+    active_tip: Hash256,
+    peer_tip: Hash256,
+    holds_provider_lease: bool,
+) -> bool {
+    !holds_provider_lease && peer_tip != active_tip
+}
+
 fn mark_recovery_spool_unverified(config: &NodeConfig, peer: &str, reason: &str) {
     let key = cursor_key(peer);
     if let Some(cursor) = branch_sync_cursors()
@@ -12581,7 +12598,11 @@ fn sync_with_peer(
                                             active_recovery_tip,
                                             true,
                                         );
-                                    } else if peer_tip_hash != active_recovery_tip {
+                                    } else if recovery_provider_is_deferred(
+                                        active_recovery_tip,
+                                        peer_tip_hash,
+                                        recovery_job_lease.is_some(),
+                                    ) {
                                         if remove_stale_recovery_witness(
                                             config,
                                             active_recovery_tip,
@@ -12592,6 +12613,10 @@ fn sync_with_peer(
                                                 active_recovery_tip.to_hex()
                                             );
                                         }
+                                        eprintln!(
+                                            "p2p sync to {peer} deferred: recovery job already has an active provider"
+                                        );
+                                        break;
                                     } else if let Some(heights) = register_recovery_peer_role(
                                         config,
                                         peer,
@@ -20500,6 +20525,79 @@ mod tests {
             .expect("peer recovery keys")
             .remove(&peer);
         fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn complete_recovery_spool_normalizes_a_stale_retrieving_state() {
+        let path = test_path("recovery-spool-complete-state");
+        let config = test_rpc_node_config(&path, Vec::new());
+        let mut node_storage = NodeStorage::Full(SledStorage::open(&path).expect("open storage"));
+        initialize_genesis(&mut node_storage, NodeMode::Full).expect("genesis");
+        let storage = Arc::new(Mutex::new(node_storage));
+        let peer = format!("recovery-spool-complete-peer-{}", unix_now());
+        let tip = Hash256([0x76; 32]);
+        let key = recovery_cursor_key(tip);
+        set_peer_recovery_key(&peer, tip);
+        let mut cursor = new_branch_sync_cursor(tip, 0, "BLQ-RX/2".to_string());
+        cursor.ancestor_height = Some(0);
+        cursor.ancestor_hash = Some(genesis_header().hash());
+        cursor.staged_height = 0;
+        cursor.next_height = 1;
+        cursor.expected_parent_hash = Some(tip);
+        cursor.spool_verified = true;
+        cursor.state = "retrieving".to_string();
+        branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .insert(key.clone(), cursor);
+
+        reconcile_forward_recovery_spool(&config, &storage, &peer).expect("spool reconcile");
+        let cursor = branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .get(&key)
+            .cloned()
+            .expect("cursor");
+        assert_eq!(cursor.state, "complete");
+        assert_eq!(cursor.requested_height, None);
+
+        branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .remove(&key);
+        peer_recovery_keys()
+            .lock()
+            .expect("peer recovery keys")
+            .remove(&peer);
+        fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn recovery_watchdog_allows_slow_progress_but_bounds_no_progress() {
+        assert!(!recovery_progress_timed_out(true, Duration::from_secs(20)));
+        assert!(!recovery_progress_timed_out(true, Duration::from_secs(29)));
+        assert!(recovery_progress_timed_out(true, Duration::from_secs(30)));
+        assert!(!recovery_progress_timed_out(false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn alternate_moving_tip_waits_for_the_active_recovery_provider() {
+        let active_tip = Hash256([0x41; 32]);
+        let alternate_tip = Hash256([0x42; 32]);
+
+        assert!(recovery_provider_is_deferred(
+            active_tip,
+            alternate_tip,
+            false
+        ));
+        assert!(!recovery_provider_is_deferred(
+            active_tip, active_tip, false
+        ));
+        assert!(!recovery_provider_is_deferred(
+            active_tip,
+            alternate_tip,
+            true
+        ));
     }
 
     #[test]
