@@ -348,14 +348,14 @@
     },
     {
       "repository": "blq-node",
-      "path": "RELEASE-v0.1.0.md",
+      "path": "docs/releases/RELEASE-v0.1.0.md",
       "sha256": "65c79c69095a82164e23c07091b72001cbf2bd16ea7f4e6f5251ecebc03751fe",
       "source": "RELEASE.md",
       "sourceSha256": "65c79c69095a82164e23c07091b72001cbf2bd16ea7f4e6f5251ecebc03751fe"
     },
     {
       "repository": "blq-node",
-      "path": "RELEASE-PREPARATION.md",
+      "path": "docs/releases/RELEASE-PREPARATION.md",
       "sha256": "56071b8528a26f0e85fa7e427497b834dbfcce09944654ef6fb4ba55941594ef",
       "source": null,
       "sourceSha256": null

@@ -65,9 +65,10 @@ Documentation addresses in defaults are placeholders. Run
 
 This repository contains the v0.1.0 public source snapshot, the v0.1.1 native
 RandomX cache correction, and the v0.1.2 recovery update. See
-`RELEASE-v0.1.2.md` for the current patch scope; earlier release records remain
-available for provenance. `source-manifest.json` records the original exported
-snapshot hashes. This source release is not an independent security audit.
+[`docs/releases/RELEASE-v0.1.2.md`](docs/releases/RELEASE-v0.1.2.md) for the
+current patch scope. Earlier release records, source manifests, and checksums
+are collected in [`docs/releases/`](docs/releases/). This source release is not
+an independent security audit.
 
 ## Public services
 

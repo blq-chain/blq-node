@@ -10,7 +10,7 @@ from isolated staging copies on Windows:
 - The public WebSocket endpoint accepted newHeads, logs, and
   newPendingTransactions subscriptions, then accepted unsubscribe and
   rejected an unsupported subscription.
-- Source file hashes are listed in SHA256SUMS.
+- Source file hashes are listed in `SHA256SUMS-v0.1.0`.
 
 The native RandomX Windows artifact build requires CMake and an MSVC developer
 environment. They were not available on the staging host, so that artifact
