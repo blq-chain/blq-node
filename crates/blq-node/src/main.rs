@@ -218,6 +218,11 @@ static BLOCK_GOSSIP_RELAYED: AtomicU64 = AtomicU64::new(0);
 static BLOCK_GOSSIP_FAILURES: AtomicU64 = AtomicU64::new(0);
 static BLOCK_GOSSIP_DEDUPLICATED: AtomicU64 = AtomicU64::new(0);
 static LAST_BLOCK_GOSSIP_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+// Snapshotting and retention pruning are operational maintenance. They must
+// not extend the synchronous response after a canonical block is committed.
+static CANONICAL_MAINTENANCE_QUEUE: OnceLock<SyncSender<CanonicalMaintenanceJob>> = OnceLock::new();
+static CANONICAL_MAINTENANCE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static DISCOVERED_PEER_ROUTES: OnceLock<Mutex<BTreeMap<String, PeerRecord>>> = OnceLock::new();
 static ACTIVE_DISCOVERY_ROUTES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 const MAX_DISCOVERY_WORKERS: usize = 16;
@@ -235,6 +240,12 @@ struct BlockGossipJob {
     genesis_hash: Hash256,
     block: Block,
     source_peer: Option<String>,
+}
+
+#[derive(Clone)]
+struct CanonicalMaintenanceJob {
+    config: NodeConfig,
+    storage: Arc<Mutex<NodeStorage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -3631,6 +3642,7 @@ fn run_node(config: Option<String>, mode_override: impl Into<Option<NodeMode>>) 
     }
     load_branch_sync_cursors(&config);
     let storage = Arc::new(Mutex::new(NodeStorage::open(&config)?));
+    start_canonical_maintenance_worker();
     {
         let mut storage = storage.lock().expect("storage mutex poisoned");
         if storage.is_empty() {
@@ -3701,6 +3713,67 @@ fn run_node(config: Option<String>, mode_override: impl Into<Option<NodeMode>>) 
         eprintln!("networking disabled; enable [network] for p2p sync");
     }
     Ok(())
+}
+
+fn start_canonical_maintenance_worker() {
+    CANONICAL_MAINTENANCE_QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<CanonicalMaintenanceJob>(8);
+        thread::spawn(move || canonical_maintenance_worker(receiver));
+        sender
+    });
+}
+
+fn schedule_canonical_maintenance(config: &NodeConfig, storage: &Arc<Mutex<NodeStorage>>) {
+    if CANONICAL_MAINTENANCE_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let sender = CANONICAL_MAINTENANCE_QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<CanonicalMaintenanceJob>(8);
+        thread::spawn(move || canonical_maintenance_worker(receiver));
+        sender
+    });
+    if sender
+        .try_send(CanonicalMaintenanceJob {
+            config: config.clone(),
+            storage: Arc::clone(storage),
+        })
+        .is_err()
+    {
+        CANONICAL_MAINTENANCE_PENDING.store(false, Ordering::Release);
+    }
+}
+
+fn canonical_maintenance_worker(receiver: Receiver<CanonicalMaintenanceJob>) {
+    while let Ok(job) = receiver.recv() {
+        // The immediate next template has priority over filesystem work.
+        thread::sleep(Duration::from_millis(25));
+        CANONICAL_MAINTENANCE_PENDING.store(false, Ordering::Release);
+        let storage = job.storage.lock().expect("storage mutex poisoned");
+        if let Err(err) = write_periodic_snapshot(&job.config, &storage) {
+            eprintln!("periodic generation snapshot failed: {err}");
+        }
+        if job.config.node.pruning_enabled() {
+            match prune_floor(&job.config, &storage).and_then(|floor| {
+                storage
+                    .prune_old_blocks(job.config.node.max_storage_bytes, floor)
+                    .map_err(Into::into)
+            }) {
+                Ok(()) => {}
+                Err(err) => eprintln!("canonical maintenance pruning failed: {err}"),
+            }
+        }
+    }
+}
+
+fn invalidate_local_template_cache() {
+    LOCAL_TEMPLATE_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("local template cache mutex poisoned")
+        .take();
 }
 
 fn start_candidate_recovery(config: &NodeConfig, storage: Arc<Mutex<NodeStorage>>) {
@@ -6207,6 +6280,11 @@ fn rpc_submit_block(
     let hash = block.header.hash().to_hex();
     let number = block.header.number.0;
     let accepted_block = block.clone();
+    let included_hashes = block
+        .transactions
+        .iter()
+        .map(Transaction::hash)
+        .collect::<Vec<_>>();
     let storage_arc = Arc::clone(storage);
     {
         let mut storage = storage.lock().expect("storage mutex poisoned");
@@ -6305,31 +6383,16 @@ fn rpc_submit_block(
         if let Err(err) = ensure_storage_cap(config, &storage) {
             return rpc_error(id, -32000, &err.to_string());
         }
-        let included_hashes = block
-            .transactions
-            .iter()
-            .map(Transaction::hash)
-            .collect::<Vec<_>>();
         if let Err(err) = storage.insert_block(block) {
             return rpc_error(id, -32000, &err.to_string());
         }
-        if let Err(err) = write_periodic_snapshot(config, &storage) {
-            eprintln!("periodic generation snapshot failed: {err}");
-        }
-        if config.node.pruning_enabled() {
-            let floor = match prune_floor(config, &storage) {
-                Ok(floor) => floor,
-                Err(err) => return rpc_error(id, -32000, &err.to_string()),
-            };
-            if let Err(err) = storage.prune_old_blocks(config.node.max_storage_bytes, floor) {
-                return rpc_error(id, -32000, &err.to_string());
-            }
-        }
-        mempool
-            .lock()
-            .expect("mempool mutex poisoned")
-            .remove_included(&included_hashes);
+        invalidate_local_template_cache();
     }
+    mempool
+        .lock()
+        .expect("mempool mutex poisoned")
+        .remove_included(&included_hashes);
+    schedule_canonical_maintenance(config, &storage_arc);
     let genesis_hash = {
         let storage = storage_arc.lock().expect("storage mutex poisoned");
         configured_genesis_hash(&storage).unwrap_or_else(|_| genesis_header().hash())
@@ -6525,6 +6588,15 @@ fn rpc_node_info(
         .clone();
     let remaining = network_height.saturating_sub(current_height);
     let peer_count = peer_agreement().lock().map(|g| g.tips.len()).unwrap_or(0);
+    let explorer_provider_count = DISCOVERED_PEER_ROUTES
+        .get()
+        .and_then(|routes| {
+            routes
+                .lock()
+                .ok()
+                .map(|routes| routes.values().filter(|peer| peer.explorer_share).count())
+        })
+        .unwrap_or(0);
     let stale_peer_targets = peer_agreement()
         .lock()
         .map(|g| {
@@ -6713,6 +6785,12 @@ fn rpc_node_info(
             "candidateWork": candidate.as_ref().and_then(|candidate| candidate.get("work")).cloned().unwrap_or(serde_json::Value::Null),
             "syncRemainingBlocks": remaining,
             "peerCount": peer_count,
+            "explorer": serde_json::json!({
+                "indexEnabled": config.explorer.index_enabled(config.node.storage_mode),
+                "sharingEnabled": config.explorer.share_enabled(config.node.storage_mode),
+                "relayEnabled": config.explorer.relay,
+                "providerCount": explorer_provider_count,
+            }),
             "status": status_str,
             "activity": activity_str,
             "isSyncing": is_syncing,
@@ -9563,8 +9641,32 @@ struct NodeConfig {
     node: NodeSection,
     rpc: RpcSection,
     network: NetworkSection,
+    #[serde(default)]
+    explorer: ExplorerSection,
     discovery: ServiceSection,
     relay: ServiceSection,
+}
+
+/// Explorer configuration controls derived operational data only. It never
+/// participates in consensus, fork choice, or block validation.
+#[derive(Clone, Debug, Deserialize)]
+struct ExplorerSection {
+    #[serde(default)]
+    index: Option<bool>,
+    #[serde(default)]
+    share: Option<bool>,
+    #[serde(default = "default_true")]
+    relay: bool,
+}
+
+impl Default for ExplorerSection {
+    fn default() -> Self {
+        Self {
+            index: None,
+            share: None,
+            relay: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -9620,6 +9722,18 @@ enum StorageMode {
 impl NodeSection {
     fn pruning_enabled(&self) -> bool {
         self.storage_mode == StorageMode::Pruned || self.prune_history
+    }
+}
+
+impl ExplorerSection {
+    fn index_enabled(&self, storage_mode: StorageMode) -> bool {
+        self.index.unwrap_or(storage_mode == StorageMode::Archive)
+    }
+
+    fn share_enabled(&self, storage_mode: StorageMode) -> bool {
+        self.share
+            .unwrap_or(storage_mode == StorageMode::Archive && self.index_enabled(storage_mode))
+            && self.index_enabled(storage_mode)
     }
 }
 
@@ -11567,6 +11681,14 @@ struct PeerRecord {
     retained_to_height: u64,
     #[serde(default)]
     snapshot_heights: Vec<u64>,
+    /// Advertises derived explorer capabilities only after authentication.
+    /// These fields have no consensus or fork-choice effect.
+    #[serde(default)]
+    explorer_index: bool,
+    #[serde(default)]
+    explorer_share: bool,
+    #[serde(default)]
+    explorer_relay: bool,
 }
 
 fn default_route_class() -> String {
@@ -13366,6 +13488,9 @@ fn register_with_discovery_servers(
         retained_from_height: retained_from,
         retained_to_height: retained_to,
         snapshot_heights,
+        explorer_index: config.explorer.index_enabled(config.node.storage_mode),
+        explorer_share: config.explorer.share_enabled(config.node.storage_mode),
+        explorer_relay: config.explorer.relay,
     };
     let identity = NodeIdentity::load_or_create(Path::new(&config.node.data_dir))?;
     let identity_public_key = identity.public_key_hex();
@@ -14562,20 +14687,6 @@ fn import_network_block(
     ensure_storage_cap(config, &storage_guard)?;
     let imported_block = block.clone();
     storage_guard.insert_block(block)?;
-    if let Err(err) = write_periodic_snapshot(config, &storage_guard) {
-        eprintln!("periodic generation snapshot failed: {err}");
-    }
-    // Pruning is maintenance, not consensus validation. Running it for every
-    // network body repeatedly scans storage and starves RPC during catch-up;
-    // batch it at the same bounded checkpoint cadence used by recovery.
-    if config.node.pruning_enabled()
-        && imported_block.header.number.0 % RECOVERY_MIN_BATCH_BODIES as u64 == 0
-    {
-        storage_guard.prune_old_blocks(
-            config.node.max_storage_bytes,
-            prune_floor(config, &storage_guard)?,
-        )?;
-    }
     drain_orphan_blocks(config, &mut storage_guard)?;
     drop(storage_guard);
     let included_hashes = imported_block
@@ -14589,6 +14700,8 @@ fn import_network_block(
             .expect("mempool mutex poisoned")
             .remove_included(&included_hashes);
     }
+    invalidate_local_template_cache();
+    schedule_canonical_maintenance(config, storage);
     // Keep lock-free status aligned with the committed canonical prefix. A
     // busy storage mutex must not leave blq_nodeInfo reporting an old height.
     record_sync_progress(
@@ -18857,6 +18970,7 @@ mod tests {
                 relay_servers: Vec::new(),
                 trusted_peer_keys: Vec::new(),
             },
+            explorer: ExplorerSection::default(),
             discovery: ServiceSection {
                 enabled: false,
                 bind: "127.0.0.1:0".to_string(),
@@ -18866,6 +18980,25 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn explorer_defaults_follow_storage_mode_and_allow_operator_opt_out() {
+        let defaults = ExplorerSection::default();
+        assert!(defaults.index_enabled(StorageMode::Archive));
+        assert!(defaults.share_enabled(StorageMode::Archive));
+        assert!(!defaults.index_enabled(StorageMode::Pruned));
+        assert!(!defaults.share_enabled(StorageMode::Pruned));
+        assert!(defaults.relay);
+
+        let opt_out = ExplorerSection {
+            index: Some(false),
+            share: Some(false),
+            relay: false,
+        };
+        assert!(!opt_out.index_enabled(StorageMode::Archive));
+        assert!(!opt_out.share_enabled(StorageMode::Archive));
+        assert!(!opt_out.relay);
     }
 
     #[test]
@@ -19819,6 +19952,9 @@ mod tests {
             retained_from_height: 0,
             retained_to_height: 1,
             snapshot_heights: Vec::new(),
+            explorer_index: false,
+            explorer_share: false,
+            explorer_relay: true,
         };
         assert!(validate_peer_record(&peer).is_err());
         let peer = PeerRecord {
@@ -19842,6 +19978,9 @@ mod tests {
             retained_from_height: 0,
             retained_to_height: 1,
             snapshot_heights: Vec::new(),
+            explorer_index: false,
+            explorer_share: false,
+            explorer_relay: true,
         };
         assert!(validate_peer_record(&peer).is_err());
     }
@@ -19872,6 +20011,9 @@ mod tests {
             retained_from_height: 0,
             retained_to_height: 1,
             snapshot_heights: Vec::new(),
+            explorer_index: false,
+            explorer_share: false,
+            explorer_relay: true,
         };
         let signature = identity.sign(&service_auth_payload(
             "BLQ-DISCOVERY-REGISTER-v1",

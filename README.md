@@ -39,6 +39,20 @@ The v0.1.2 recovery update changes node synchronization only. It does not
 change chain ID, genesis, BLQ-RX/2 Proof of Work, transaction rules, mining
 selection, account state, or canonical fork choice.
 
+## Explorer capability
+
+The optional `[explorer]` section advertises operational capabilities only
+after an authenticated P2P handshake. Archive nodes default to indexing and
+sharing their retained canonical data; pruned nodes default to relaying a
+compatible request toward an available provider. Either node type can opt out
+with `index = false`, `share = false`, or `relay = false`.
+
+This does not expose a node's RPC, admin endpoint, identity, or private
+network routes. It also has no effect on consensus or fork choice. Nodes can
+already request anchored historical blocks, transactions, and receipts from
+authenticated peers; distributed indexed list queries remain a future
+compatibility layer rather than a claim made by this release.
+
 ## Optional gateway
 
 `gateway/` contains the public RPC edge and policy tests. Configure

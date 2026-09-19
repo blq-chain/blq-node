@@ -33,6 +33,13 @@ discovery_servers = []
 relay_servers = []
 trusted_peer_keys = []
 
+# Archive nodes opt in by default. Pruned nodes default to relaying provider
+# capability only; operators can override either default explicitly.
+[explorer]
+# index = true
+# share = true
+relay = true
+
 [discovery]
 enabled = false
 bind = "0.0.0.0:30335"
