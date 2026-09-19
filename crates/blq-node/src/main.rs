@@ -7218,21 +7218,55 @@ fn load_rpc_transaction(
 }
 
 fn historical_peers(config: &NodeConfig) -> Vec<String> {
-    let mut peers = config.network.bootstrap_peers.clone();
+    let mut advertised = Vec::new();
     if config.node.historical_peer_fallback {
         if let Ok(discovered) = discover_peer_records(config) {
-            peers.extend(
-                discovered
-                    .into_iter()
-                    .filter(|peer| {
-                        peer.storage_mode == StorageMode::Archive || peer.retained_to_height > 0
-                    })
-                    .map(|peer| peer.address),
+            advertised.extend(discovered);
+        }
+        if let Some(routes) = DISCOVERED_PEER_ROUTES.get() {
+            advertised.extend(
+                routes
+                    .lock()
+                    .expect("discovered peer routes poisoned")
+                    .values()
+                    .cloned(),
             );
         }
     }
-    peers.sort();
-    peers.dedup();
+
+    // An authenticated archive/share advertisement is preferred for an
+    // historical lookup. Older compatible peers did not send the capability
+    // fields, so an archive retained range remains a backwards-compatible
+    // provider hint. Every response is still anchored to a local canonical
+    // header or transaction hash before the caller accepts it.
+    advertised.retain(|peer| {
+        validate_peer_record(peer).is_ok()
+            && peer_route_is_fresh(peer)
+            && (peer.explorer_share
+                || (peer.storage_mode == StorageMode::Archive && peer.retained_to_height > 0))
+    });
+    advertised.sort_by_key(|peer| {
+        (
+            !peer.explorer_share,
+            route_priority(&peer.address),
+            peer.address.clone(),
+        )
+    });
+
+    let mut peers = advertised
+        .into_iter()
+        .flat_map(|peer| {
+            std::iter::once(peer.address)
+                .chain(peer.alternate_addresses.into_iter())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    peers.extend(config.network.bootstrap_peers.iter().cloned());
+    if config.node.historical_peer_fallback {
+        peers.extend(cached_peer_endpoints());
+    }
+    let mut seen = BTreeSet::new();
+    peers.retain(|peer| seen.insert(peer.clone()));
     peers
 }
 
