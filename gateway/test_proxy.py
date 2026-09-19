@@ -88,14 +88,19 @@ class PublicRpcPolicyTests(unittest.TestCase):
         self.assertTrue(method_allowed("blq_submitBlock", ""))
         self.assertTrue(method_allowed("blq_submitBlock", "legacy-token"))
 
-    def test_mining_capacity_is_bounded_separately(self):
-        first = proxy._mining_inflight.acquire(blocking=False)
-        self.assertTrue(first)
+    def test_template_and_submission_capacity_are_bounded_separately(self):
+        template = proxy._template_inflight.acquire(blocking=False)
+        submit = proxy._submit_inflight.acquire(blocking=False)
+        self.assertTrue(template)
+        self.assertTrue(submit)
         try:
-            self.assertGreaterEqual(proxy.MINING_MAX_INFLIGHT, 1)
+            self.assertGreaterEqual(proxy.TEMPLATE_MAX_INFLIGHT, 1)
+            self.assertGreaterEqual(proxy.SUBMIT_MAX_INFLIGHT, 1)
         finally:
-            if first:
-                proxy._mining_inflight.release()
+            if template:
+                proxy._template_inflight.release()
+            if submit:
+                proxy._submit_inflight.release()
 
     def test_hashrate_telemetry_capacity_is_bounded_separately(self):
         first = proxy._telemetry_inflight.acquire(blocking=False)

@@ -39,7 +39,8 @@ MAX_BODY = 256 * 1024
 MAX_INFLIGHT = int(os.environ.get("BLQ_MAX_INFLIGHT", "32"))
 READ_MAX_INFLIGHT = int(os.environ.get("BLQ_READ_MAX_INFLIGHT", "24"))
 TRANSACTION_MAX_INFLIGHT = int(os.environ.get("BLQ_TRANSACTION_MAX_INFLIGHT", "4"))
-MINING_MAX_INFLIGHT = int(os.environ.get("BLQ_MINING_MAX_INFLIGHT", "2"))
+TEMPLATE_MAX_INFLIGHT = int(os.environ.get("BLQ_TEMPLATE_MAX_INFLIGHT", os.environ.get("BLQ_MINING_MAX_INFLIGHT", "2")))
+SUBMIT_MAX_INFLIGHT = int(os.environ.get("BLQ_SUBMIT_MAX_INFLIGHT", "2"))
 TELEMETRY_MAX_INFLIGHT = int(os.environ.get("BLQ_TELEMETRY_MAX_INFLIGHT", "4"))
 RATE = 10.0
 BURST = 20.0
@@ -101,7 +102,8 @@ _buckets = {}
 _inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
 _read_inflight = threading.BoundedSemaphore(READ_MAX_INFLIGHT)
 _transaction_inflight = threading.BoundedSemaphore(TRANSACTION_MAX_INFLIGHT)
-_mining_inflight = threading.BoundedSemaphore(MINING_MAX_INFLIGHT)
+_template_inflight = threading.BoundedSemaphore(TEMPLATE_MAX_INFLIGHT)
+_submit_inflight = threading.BoundedSemaphore(SUBMIT_MAX_INFLIGHT)
 _telemetry_inflight = threading.BoundedSemaphore(TELEMETRY_MAX_INFLIGHT)
 HTTP_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("BLQ_HTTP_SOCKET_TIMEOUT_SECONDS", "15"))
 RELAY_QUEUE_SIZE = int(os.environ.get("BLQ_RELAY_QUEUE_SIZE", "128"))
@@ -117,6 +119,8 @@ _transaction_metrics = {
     "relaySuccesses": 0,
     "relayFailures": 0,
     "upstreamTimeouts": 0,
+    "templateBusy": 0,
+    "submitBusy": 0,
 }
 MAX_RATE_BUCKETS = 10_000
 PUBLIC_NODE_INFO_FIELDS = (
@@ -138,6 +142,7 @@ PUBLIC_NODE_INFO_FIELDS = (
     "status",
     "isSyncing",
     "isMining",
+    "explorer",
     "lastCanonicalBlockAt",
     "blockAgeSeconds",
     "liveness",
@@ -499,7 +504,8 @@ class Handler(BaseHTTPRequestHandler):
         if not _inflight.acquire(blocking=False):
             self.send_json(error(None, -32005, "public RPC is busy"), 503)
             return
-        mining_slot = False
+        template_slot = False
+        submit_slot = False
         read_slot = False
         transaction_slot = False
         telemetry_slot = False
@@ -534,11 +540,22 @@ class Handler(BaseHTTPRequestHandler):
                     response = error(item.get("id") if isinstance(item, dict) else None, -32601, "method not available on public RPC")
                     self.send_json(response)
                     return
-            if any(item.get("method") in MINING_METHODS for item in requests):
-                if not _mining_inflight.acquire(blocking=False):
-                    self.send_json(error(None, -32005, "public mining RPC is busy"), 503)
+            mining_methods = {item.get("method") for item in requests if item.get("method") in MINING_METHODS}
+            if len(mining_methods) > 1:
+                self.send_json(error(None, -32600, "template and block submission must be sent separately"), 400)
+                return
+            if "blq_getBlockTemplate" in mining_methods:
+                if not _template_inflight.acquire(blocking=False):
+                    record_transaction_metric("templateBusy")
+                    self.send_json(error(None, -32005, "public mining template capacity is busy; retry shortly"), 503)
                     return
-                mining_slot = True
+                template_slot = True
+            if "blq_submitBlock" in mining_methods:
+                if not _submit_inflight.acquire(blocking=False):
+                    record_transaction_metric("submitBusy")
+                    self.send_json(error(None, -32005, "public mining submission capacity is busy; retry shortly"), 503)
+                    return
+                submit_slot = True
             transaction_request = any(item.get("method") in TRANSACTION_METHODS for item in requests)
             telemetry_request = any(item.get("method") in TELEMETRY_METHODS for item in requests)
             if telemetry_request and len(requests) != 1:
@@ -549,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(error(None, -32005, "public telemetry RPC is busy"), 503)
                     return
                 telemetry_slot = True
-            if not transaction_request and not telemetry_request and not any(item.get("method") in MINING_METHODS for item in requests):
+            if not transaction_request and not telemetry_request and not mining_methods:
                 if not _read_inflight.acquire(blocking=False):
                     self.send_json(error(None, -32005, "public RPC read capacity is busy"), 503)
                     return
@@ -563,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
                 record_transaction_metric("submissionsReceived")
             body = forward_json_rpc(
                 request,
-                mining=any(item.get("method") in MINING_METHODS for item in requests),
+                mining=bool(mining_methods),
                 transaction=transaction_request,
                 upstreams=MINING_UPSTREAMS if telemetry_request else None,
             )
@@ -581,8 +598,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self.send_json(error(None, -32000, "upstream RPC unavailable; retry shortly"), 503)
         finally:
-            if mining_slot:
-                _mining_inflight.release()
+            if template_slot:
+                _template_inflight.release()
+            if submit_slot:
+                _submit_inflight.release()
             if transaction_slot:
                 _transaction_inflight.release()
             if telemetry_slot:
