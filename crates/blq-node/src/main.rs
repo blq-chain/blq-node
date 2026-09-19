@@ -3688,8 +3688,10 @@ fn run_node(config: Option<String>, mode_override: impl Into<Option<NodeMode>>) 
         }
     }
     let mempool = Arc::new(Mutex::new(validated_mempool));
+    reconcile_mempool_with_canonical_state(&storage, &mempool);
     start_mempool_persistence(
         mempool_path,
+        Arc::clone(&storage),
         Arc::clone(&mempool),
         config.node.filesystem_reserve_bytes,
     );
@@ -4364,6 +4366,7 @@ fn start_rpc_server(
 
 fn start_mempool_persistence(
     path: std::path::PathBuf,
+    storage: Arc<Mutex<NodeStorage>>,
     mempool: Arc<Mutex<Mempool>>,
     filesystem_reserve_bytes: u64,
 ) {
@@ -4393,6 +4396,7 @@ fn start_mempool_persistence(
                 reserve_unavailable = false;
                 last_reserve_warning = None;
             }
+            reconcile_mempool_with_canonical_state(&storage, &mempool);
             let mempool = mempool.lock().expect("mempool mutex poisoned");
             if let Err(err) = mempool.save(&path) {
                 eprintln!("mempool could not be persisted: {err}");
@@ -5145,7 +5149,7 @@ fn handle_json_rpc_value(
         "blq_nodeInfo" | "blq_health" => rpc_node_info(id, config, storage),
         "blq_supply" => rpc_supply(id, storage),
         "blq_status" => rpc_status(id, config, storage),
-        "blq_pendingTransactions" => rpc_pending_transactions(id, mempool),
+        "blq_pendingTransactions" => rpc_pending_transactions(id, storage, mempool),
         "blq_sendTransaction" => rpc_send_transaction(id, config, storage, mempool, parsed),
         "eth_blockNumber" => {
             let height = match storage
@@ -6195,10 +6199,46 @@ fn build_bounded_stateful_block(
     }
 }
 
-fn rpc_pending_transactions(id: serde_json::Value, mempool: &Arc<Mutex<Mempool>>) -> String {
+fn reconcile_mempool_with_canonical_state(
+    storage: &Arc<Mutex<NodeStorage>>,
+    mempool: &Arc<Mutex<Mempool>>,
+) -> usize {
+    // Keep storage and mempool locking in separate phases. Block import takes
+    // storage before mempool, so the opposite order here could deadlock RPC
+    // against a canonical import.
+    let senders = {
+        let mempool = mempool.lock().expect("mempool mutex poisoned");
+        mempool
+            .pending()
+            .iter()
+            .map(|transaction| transaction.from)
+            .collect::<BTreeSet<_>>()
+    };
+    let confirmed_nonces = {
+        let storage = storage.lock().expect("storage mutex poisoned");
+        senders
+            .into_iter()
+            .map(|sender| (sender, storage.nonce(sender).unwrap_or(0)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let mut mempool = mempool.lock().expect("mempool mutex poisoned");
+    let pending_before = mempool.pending().len();
+    mempool.remove_stale_nonces(|sender| *confirmed_nonces.get(&sender).unwrap_or(&0));
+    pending_before.saturating_sub(mempool.pending().len())
+}
+
+fn rpc_pending_transactions(
+    id: serde_json::Value,
+    storage: &Arc<Mutex<NodeStorage>>,
+    mempool: &Arc<Mutex<Mempool>>,
+) -> String {
     const MAX_PENDING_TRANSACTIONS: usize = 256;
     const MAX_PENDING_RESPONSE_BYTES: usize = 256 * 1024;
     let now = unix_now();
+    // Recovery can publish a locally validated canonical range before its
+    // ordinary gossip importer observes each body. Never expose already
+    // confirmed transactions as active pending entries.
+    reconcile_mempool_with_canonical_state(storage, mempool);
     let pending = {
         let mut mempool = mempool.lock().expect("mempool mutex poisoned");
         mempool.remove_expired(now, MEMPOOL_TRANSACTION_EXPIRY_SECONDS);
@@ -19909,6 +19949,55 @@ mod tests {
         )
         .expect("duplicate gossip transaction accepted");
         assert_eq!(mempool.lock().expect("mempool").pending().len(), 1);
+        fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn pending_rpc_removes_confirmed_nonces_but_keeps_current_nonce() {
+        let path = test_path("pending-rpc-confirmed-nonce");
+        let mut node_storage = NodeStorage::Full(SledStorage::open(&path).expect("open storage"));
+        initialize_genesis(&mut node_storage, NodeMode::Full).expect("genesis");
+        let sender = Address([0x42; 20]);
+        if let NodeStorage::Full(storage) = &node_storage {
+            storage
+                .put_account(sender, Bix(1_000_000_000_000_000_000), 1)
+                .expect("advance sender nonce");
+        }
+        let storage = Arc::new(Mutex::new(node_storage));
+        let mempool = Arc::new(Mutex::new(Mempool::default()));
+        for nonce in [0, 1] {
+            mempool
+                .lock()
+                .expect("mempool")
+                .add(
+                    Transaction {
+                        chain_id: MAINNET_CHAIN_ID,
+                        transaction_type: 2,
+                        nonce,
+                        from: sender,
+                        to: Some(Address([0x24; 20])),
+                        value: Bix(0),
+                        gas_limit: TRANSFER_GAS,
+                        max_fee_per_gas: Bix(1_000_000_000),
+                        max_priority_fee_per_gas: Bix(0),
+                        payload: Vec::new(),
+                        access_list: Vec::new(),
+                        signature: None,
+                        external_hash: None,
+                    },
+                    Bix(1_000_000_000),
+                )
+                .expect("add pending transaction");
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&rpc_pending_transactions(
+            serde_json::json!(1),
+            &storage,
+            &mempool,
+        ))
+        .expect("valid RPC response");
+        assert_eq!(response["result"].as_array().map(Vec::len), Some(1));
+        assert_eq!(mempool.lock().expect("mempool").pending()[0].nonce, 1);
         fs::remove_dir_all(path).ok();
     }
 
