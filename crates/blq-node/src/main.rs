@@ -2611,15 +2611,9 @@ fn reconcile_forward_recovery_spool(
         );
         return Ok(());
     }
-    // A verified spool still needs reconciliation when a moving provider
-    // streamed bodies beyond the tip advertised in the hello that created
-    // this job.  Those bodies are locally validated and contiguous, so their
-    // final hash is the job's new safe target; do not leave publication tied
-    // to the old signed tip.
-    if cursor.spool_verified && cursor.staged_height <= cursor.tip_height {
-        return Ok(());
-    }
-    let (canonical_ancestor, spool) = {
+    // Reconcile even when the cursor appears complete: a live canonical gossip
+    // block can be the first missing body for this durable job.
+    let (canonical_ancestor, canonical_root, spool) = {
         let storage = storage.lock().expect("storage mutex poisoned");
         // Versions before the stable-spool fix wrote newly received bodies
         // under the moving advertised tip.  Merge that one legacy namespace
@@ -2637,6 +2631,10 @@ fn reconcile_forward_recovery_spool(
         }
         (
             storage.block_by_number(ancestor_height)?,
+            storage
+                .block_by_number(ancestor_height.saturating_add(1))
+                .ok()
+                .map(|block| block.header.hash()),
             storage.recovery_spool_blocks_for_tip(spool_tip)?,
         )
     };
@@ -2647,9 +2645,40 @@ fn reconcile_forward_recovery_spool(
     let mut next_height = ancestor_height.saturating_add(1);
     let mut expected_parent = ancestor_hash;
     let mut branch_root_hash = None;
+    // A canonical block can arrive through ordinary authenticated gossip while
+    // this cursor owns a forward recovery. Once its root matches the local
+    // canonical root, resume after that local prefix rather than requesting
+    // an already committed height again.
+    if cursor
+        .branch_root_hash
+        .is_some_and(|root| canonical_root == Some(root))
+    {
+        let storage = storage.lock().expect("storage mutex poisoned");
+        let local_tip = storage.best_header()?.number.0;
+        while next_height <= local_tip && next_height <= cursor.tip_height {
+            let block = match storage.block_by_number(next_height) {
+                Ok(block) => block,
+                Err(_) => break,
+            };
+            if block.header.parent_hash != expected_parent {
+                break;
+            }
+            branch_root_hash.get_or_insert(block.header.hash());
+            expected_parent = block.header.hash();
+            next_height = next_height.saturating_add(1);
+        }
+    }
+    let mut stale_local_prefix = false;
     for (block, _) in spool {
         if block.header.number.0 < next_height {
             continue;
+        }
+        if block.header.number.0 == ancestor_height.saturating_add(1)
+            && cursor.next_height <= ancestor_height.saturating_add(1)
+            && canonical_root == Some(block.header.hash())
+        {
+            stale_local_prefix = true;
+            break;
         }
         if block.header.number.0 != next_height || block.header.parent_hash != expected_parent {
             break;
@@ -2661,8 +2690,25 @@ fn reconcile_forward_recovery_spool(
         expected_parent = block.header.hash();
         next_height = next_height.saturating_add(1);
     }
-    let imported = next_height.saturating_sub(ancestor_height.saturating_add(1));
-    let staged_height = next_height.saturating_sub(1);
+    if stale_local_prefix {
+        storage
+            .lock()
+            .expect("storage mutex poisoned")
+            .clear_recovery_spool_for_tip(spool_tip)?;
+        next_height = ancestor_height.saturating_add(1);
+        expected_parent = ancestor_hash;
+        branch_root_hash = None;
+    }
+    let imported = if stale_local_prefix {
+        0
+    } else {
+        next_height.saturating_sub(ancestor_height.saturating_add(1))
+    };
+    let staged_height = if stale_local_prefix {
+        ancestor_height
+    } else {
+        next_height.saturating_sub(1)
+    };
     let target_advanced = staged_height > cursor.tip_height;
     let repaired = next_height != cursor.next_height
         || cursor.expected_parent_hash != Some(expected_parent)
@@ -2727,6 +2773,51 @@ fn reconcile_forward_recovery_spool(
         }
     }
     Ok(())
+}
+
+/// A canonical gossip body may race a durable forward range. Remember only
+/// the proven first body of that cursor so reconciliation can fetch the next
+/// genuinely missing body.
+fn record_canonical_recovery_root(
+    config: &NodeConfig,
+    storage: &Arc<Mutex<NodeStorage>>,
+    peer: &str,
+    block: &Block,
+) -> bool {
+    let is_canonical = storage
+        .lock()
+        .ok()
+        .and_then(|storage| storage.block_by_number(block.header.number.0).ok())
+        .is_some_and(|canonical| canonical.header.hash() == block.header.hash());
+    if !is_canonical {
+        return false;
+    }
+    let advanced = {
+        let mut cursors = match branch_sync_cursors().lock() {
+            Ok(cursors) => cursors,
+            Err(_) => return false,
+        };
+        let Some(cursor) = cursors.get_mut(&cursor_key(peer)) else {
+            return false;
+        };
+        let Some(ancestor_height) = cursor.ancestor_height else {
+            return false;
+        };
+        if block.header.number.0 != ancestor_height.saturating_add(1)
+            || cursor.ancestor_hash != Some(block.header.parent_hash)
+        {
+            return false;
+        }
+        cursor.branch_root_hash = Some(block.header.hash());
+        cursor.updated_at = unix_now();
+        true
+    };
+    if advanced {
+        if let Err(error) = persist_branch_sync_cursors(config) {
+            eprintln!("could not persist canonical recovery root: {error}");
+        }
+    }
+    advanced
 }
 
 fn recovery_progress_timed_out(has_recovery_job: bool, elapsed: Duration) -> bool {
@@ -13173,6 +13264,23 @@ fn sync_with_peer(
                             };
                             match import_result {
                                 Ok(()) => {
+                                    let direct_canonical_recovery_advanced =
+                                        match &agreement_message {
+                                            P2pMessage::BlockBody { block }
+                                                if !recovery_range_body =>
+                                            {
+                                                let advanced = record_canonical_recovery_root(
+                                                    config, &storage, peer, block,
+                                                );
+                                                if advanced {
+                                                    reconcile_forward_recovery_spool(
+                                                        config, &storage, peer,
+                                                    )?;
+                                                }
+                                                advanced
+                                            }
+                                            _ => false,
+                                        };
                                     if let Some(identity_public_key) = hello_identity {
                                         remember_verified_peer_identity(
                                             config,
@@ -13292,7 +13400,9 @@ fn sync_with_peer(
                                             recovery_rate_window = Instant::now();
                                         }
                                         let forward_complete = match &agreement_message {
-                                            P2pMessage::BlockBody { block } => {
+                                            P2pMessage::BlockBody { block }
+                                                if recovery_range_body =>
+                                            {
                                                 let complete = record_forward_recovery_progress(
                                                     config, peer, block,
                                                 );
@@ -13355,7 +13465,9 @@ fn sync_with_peer(
                                                     cursor.ancestor_height.is_some()
                                                 });
                                             if forward_recovery {
-                                                if bodies_in_range >= SYNC_RANGE_SIZE {
+                                                if direct_canonical_recovery_advanced
+                                                    || bodies_in_range >= SYNC_RANGE_SIZE
+                                                {
                                                     let next_height =
                                                         block.header.number.0.saturating_add(1);
                                                     // Persist before writing: an in-memory
@@ -13468,14 +13580,10 @@ fn sync_with_peer(
                             line.clear();
                         }
                         Err(err) if is_read_timeout(&err) => {
-                            // A nonblocking TLS read may surface EAGAIN while the
-                            // provider is still assembling the next frame. During
-                            // recovery keep the lease and durable cursor alive;
-                            // the no-progress watchdog remains the hard deadline.
-                            if recovery_job_lease.is_some() {
-                                thread::sleep(Duration::from_millis(25));
-                                continue;
-                            }
+                            // A recovery provider has no streaming work between
+                            // bounded range responses. Release a timed-out socket
+                            // and resume from the durable cursor on a fresh
+                            // authenticated session rather than retaining it.
                             record_recovery_failure(
                                 config,
                                 peer,
@@ -20784,6 +20892,60 @@ mod tests {
         assert_eq!(cursor.imported_bodies, 0);
         assert_eq!(cursor.expected_parent_hash, Some(genesis_header().hash()));
         assert!(cursor.spool_verified);
+
+        branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .remove(&key);
+        peer_recovery_keys()
+            .lock()
+            .expect("peer recovery keys")
+            .remove(&peer);
+        fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn canonical_gossip_advances_a_durable_recovery_prefix() {
+        let path = test_path("canonical-gossip-recovery-prefix");
+        let config = test_rpc_node_config(&path, Vec::new());
+        let mut node_storage = NodeStorage::Full(SledStorage::open(&path).expect("open storage"));
+        initialize_genesis(&mut node_storage, NodeMode::Full).expect("genesis");
+        let parent = node_storage.best_header().expect("genesis header");
+        let block = build_test_block(&node_storage, &parent, Hash256([0x77; 32]));
+        node_storage
+            .insert_block(block.clone())
+            .expect("canonical gossip block");
+        let storage = Arc::new(Mutex::new(node_storage));
+        let peer = format!("canonical-gossip-peer-{}", unix_now());
+        let tip = Hash256([0x78; 32]);
+        let key = recovery_cursor_key(tip);
+        set_peer_recovery_key(&peer, tip);
+        let mut cursor =
+            new_branch_sync_cursor(tip, block.header.number.0 + 2, "BLQ-RX/2".to_string());
+        cursor.ancestor_height = Some(parent.number.0);
+        cursor.ancestor_hash = Some(parent.hash());
+        cursor.next_height = block.header.number.0;
+        cursor.expected_parent_hash = Some(parent.hash());
+        cursor.state = "retrieving".to_string();
+        branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .insert(key.clone(), cursor);
+
+        assert!(record_canonical_recovery_root(
+            &config, &storage, &peer, &block
+        ));
+        reconcile_forward_recovery_spool(&config, &storage, &peer)
+            .expect("reconcile canonical gossip prefix");
+        let cursor = branch_sync_cursors()
+            .lock()
+            .expect("branch cursors")
+            .get(&key)
+            .cloned()
+            .expect("cursor");
+        assert_eq!(cursor.branch_root_hash, Some(block.header.hash()));
+        assert_eq!(cursor.next_height, block.header.number.0 + 1);
+        assert_eq!(cursor.expected_parent_hash, Some(block.header.hash()));
 
         branch_sync_cursors()
             .lock()

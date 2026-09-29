@@ -35,9 +35,12 @@ or failover route instead of starting a competing range download against the
 same durable recovery cursor. This prevents valid range responses from being
 discarded when concurrent providers race the cursor.
 
-The v0.1.2 recovery update changes node synchronization only. It does not
-change chain ID, genesis, BLQ-RX/2 Proof of Work, transaction rules, mining
-selection, account state, or canonical fork choice.
+The v0.1.4 recovery update changes node synchronization only. It records a
+canonical gossip block that arrives during forward recovery, advances the
+durable cursor across that verified local prefix, and reconnects timed-out
+range sessions from the next missing height. It does not change chain ID,
+genesis, BLQ-RX/2 Proof of Work, transaction rules, mining selection, account
+state, or canonical fork choice.
 
 ## Explorer capability
 
@@ -63,9 +66,9 @@ Documentation addresses in defaults are placeholders. Run
 
 ## Release source status
 
-This repository contains the v0.1.0 public source snapshot, the v0.1.1 native
-RandomX cache correction, and the v0.1.2 recovery update. See
-[`docs/releases/RELEASE-v0.1.2.md`](docs/releases/RELEASE-v0.1.2.md) for the
+This repository contains the v0.1.0 public source snapshot and subsequent
+maintenance updates through v0.1.4. See
+[`docs/releases/RELEASE-v0.1.4.md`](docs/releases/RELEASE-v0.1.4.md) for the
 current patch scope. Earlier release records, source manifests, and checksums
 are collected in [`docs/releases/`](docs/releases/). This source release is not
 an independent security audit.
